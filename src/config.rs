@@ -97,6 +97,14 @@ pub struct RetryConfig {
     pub backoff_factor: f64,
 }
 
+impl RetryConfig {
+    /// urllib3-style exponential backoff for retry `attempt` (1-based).
+    pub fn backoff_delay(&self, attempt: u32) -> Duration {
+        let secs = self.backoff_factor * 2f64.powi(attempt.saturating_sub(1) as i32);
+        Duration::from_secs_f64(secs.max(0.0))
+    }
+}
+
 /// Shared HTTP settings for `REQ_URL` callbacks *and* `*.url` downloads —
 /// upstream uses one `requests` session and the `REQ_*` budget for both.
 /// Parsed even when `REQ_URL` is unset (`*.url` fetching still works).
@@ -827,5 +835,31 @@ mod tests {
         let cfg = load(&e, &[]).unwrap();
         assert_eq!(cfg.sleep_time, Duration::from_secs(1));
         assert_eq!(cfg.error_throttle_sleep, Duration::from_secs(1));
+    }
+
+    #[test]
+    fn backoff_delay_is_exponential_from_attempt_one() {
+        let retries = RetryConfig {
+            total: 3,
+            connect: 3,
+            read: 3,
+            backoff_factor: 0.5,
+        };
+        assert_eq!(retries.backoff_delay(1), Duration::from_secs_f64(0.5));
+        assert_eq!(retries.backoff_delay(2), Duration::from_secs_f64(1.0));
+        assert_eq!(retries.backoff_delay(3), Duration::from_secs_f64(2.0));
+        // attempt 0 is not a real call site but must not panic or go negative.
+        assert_eq!(retries.backoff_delay(0), Duration::from_secs_f64(0.5));
+    }
+
+    #[test]
+    fn backoff_delay_clamps_negative_factor() {
+        let retries = RetryConfig {
+            total: 3,
+            connect: 3,
+            read: 3,
+            backoff_factor: -1.0,
+        };
+        assert_eq!(retries.backoff_delay(1), Duration::ZERO);
     }
 }

@@ -10,7 +10,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 
-use k8s_sidecar_rs::config::{self, Config, LogFormat, Method, Namespaces, RetryConfig};
+use k8s_sidecar_rs::config::{self, Config, LogFormat, Method, Namespaces};
 use k8s_sidecar_rs::files::{Reconciler, UrlFetcher};
 use k8s_sidecar_rs::health::{self, HealthState};
 use k8s_sidecar_rs::reload::{self, Reloader};
@@ -294,7 +294,7 @@ impl UrlFetcher for HttpFetcher {
                 Ok(resp) => {
                     if resp.status().is_server_error() && !self.settings.enable_5xx {
                         if attempt < retries.total {
-                            delay = retry_delay(retries, attempt);
+                            delay = retries.backoff_delay(attempt);
                             continue;
                         }
                         return Err(format!("{url} returned {}", resp.status()));
@@ -307,7 +307,7 @@ impl UrlFetcher for HttpFetcher {
                 }
                 Err(e) => {
                     if attempt < retries.total {
-                        delay = retry_delay(retries, attempt);
+                        delay = retries.backoff_delay(attempt);
                         continue;
                     }
                     return Err(e.to_string());
@@ -316,12 +316,6 @@ impl UrlFetcher for HttpFetcher {
         }
         unreachable!()
     }
-}
-
-fn retry_delay(retries: &RetryConfig, attempt: u32) -> Duration {
-    Duration::from_secs_f64(
-        (retries.backoff_factor * 2f64.powi(attempt.saturating_sub(1) as i32)).max(0.0),
-    )
 }
 
 fn init_logging(cfg: &Config) {
