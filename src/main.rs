@@ -1,0 +1,318 @@
+mod config;
+mod files;
+mod health;
+mod reload;
+mod watch;
+
+use std::collections::{HashMap, HashSet};
+use std::path::Path;
+use std::sync::Arc;
+use std::time::Duration;
+
+use kube::Client;
+use tokio::sync::mpsc;
+use tokio::task::JoinSet;
+use tokio_util::sync::CancellationToken;
+use tracing::{error, info};
+use tracing_subscriber::EnvFilter;
+
+use config::{Config, LogFormat, Method, Namespaces, RetryConfig};
+use files::{Reconciler, UrlFetcher};
+use health::HealthState;
+use reload::Reloader;
+use watch::{SyncEvent, reconcile_loop, run_lister, run_watcher, stream_id};
+
+const SA_NAMESPACE_FILE: &str = "/var/run/secrets/kubernetes.io/serviceaccount/namespace";
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
+/// Bounded queue between streams and the single file reconciler.
+const EVENT_QUEUE: usize = 256;
+
+fn main() {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime");
+    std::process::exit(rt.block_on(run()));
+}
+
+async fn run() -> i32 {
+    let env: HashMap<String, String> = std::env::vars().collect();
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let cfg = match config::load(&env, &args) {
+        Ok(c) => Arc::new(c),
+        Err(e) => {
+            eprintln!("configuration error: {e}");
+            return 1;
+        }
+    };
+    init_logging(&cfg);
+    info!("starting collector");
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .ok();
+
+    let namespaces = match resolve_namespaces(&cfg) {
+        Ok(n) => n,
+        Err(e) => {
+            error!(error = %e, "cannot resolve namespace");
+            return 1;
+        }
+    };
+
+    let client = match build_client(&cfg).await {
+        Ok(c) => c,
+        Err(e) => {
+            error!(error = %e, "cannot build kubernetes client");
+            return 1;
+        }
+    };
+
+    let http = match build_http_client(&cfg) {
+        Ok(c) => c,
+        Err(e) => {
+            error!(error = %e, "cannot build http client");
+            return 1;
+        }
+    };
+
+    let health = HealthState::new();
+    let cancel = CancellationToken::new();
+
+    let (tx, rx) = mpsc::channel::<SyncEvent>(EVENT_QUEUE);
+    let mut tasks = JoinSet::new();
+
+    // Expected stream ids: one per (resource kind, namespace); ALL collapses
+    // to a single cluster-wide stream per kind, like upstream.
+    let mut expected = HashSet::new();
+    for kind in &cfg.resources {
+        match &namespaces {
+            Namespaces::All => {
+                expected.insert(stream_id(*kind, "ALL"));
+            }
+            Namespaces::List(list) => {
+                for ns in list {
+                    expected.insert(stream_id(*kind, ns));
+                }
+            }
+            Namespaces::PodNamespace => unreachable!("resolved above"),
+        }
+    }
+    for s in &expected {
+        health.register_stream(s);
+    }
+
+    let fetcher = HttpFetcher {
+        http: http.clone(),
+        settings: cfg.fetch.clone(),
+    };
+    let reloader = cfg.req.clone().map(|r| Reloader::new(r, http.clone()));
+
+    let once = cfg.method == Method::List;
+    for kind in cfg.resources.clone() {
+        let ns_list: Vec<String> = match &namespaces {
+            Namespaces::All => vec!["ALL".to_string()],
+            Namespaces::List(list) => list.clone(),
+            Namespaces::PodNamespace => unreachable!(),
+        };
+        for ns in ns_list {
+            let stream_ctx = watch::StreamCtx {
+                client: client.clone(),
+                cfg: cfg.clone(),
+                tx: tx.clone(),
+                health: health.clone(),
+                cancel: cancel.clone(),
+            };
+            match cfg.effective_method(&ns) {
+                Method::Watch => {
+                    tasks.spawn(async move { run_watcher(stream_ctx, kind, ns).await })
+                }
+                Method::Sleep | Method::List => {
+                    tasks.spawn(async move { run_lister(stream_ctx, kind, ns, once).await })
+                }
+            };
+        }
+    }
+    drop(tx); // channel closes when all streams stop
+
+    {
+        let rec = Reconciler::load(
+            &cfg.folder,
+            cfg.default_file_mode,
+            cfg.ignore_already_processed,
+        );
+        let ctx = watch::ReconcileCtx {
+            cfg: cfg.clone(),
+            fetcher,
+            reloader: reloader.clone(),
+            health: health.clone(),
+            expected_streams: expected,
+            cancel: cancel.clone(),
+        };
+        tasks.spawn(async move { reconcile_loop(rx, rec, ctx).await });
+    }
+
+    if cfg.method != Method::List {
+        if let Some(r) = reloader {
+            let (c, pause) = (cancel.clone(), cfg.error_throttle_sleep);
+            tasks.spawn(async move { r.run(c, pause).await });
+        }
+        let (state, port, c) = (health.clone(), cfg.health_port, cancel.clone());
+        tasks.spawn(async move { health::serve(state, port, c).await });
+    } else {
+        // LIST exits once every stream did a single pass and the queue drains.
+        while tasks.join_next().await.is_some() {}
+        info!("list pass complete, exiting");
+        return 0;
+    }
+
+    wait_for_shutdown().await;
+    info!("shutdown signal received, stopping");
+    cancel.cancel();
+
+    let drain = tokio::time::timeout(SHUTDOWN_GRACE, async {
+        while tasks.join_next().await.is_some() {}
+    });
+    match drain.await {
+        Ok(()) => 0,
+        Err(_) => {
+            error!("tasks did not stop within grace period");
+            1
+        }
+    }
+}
+
+async fn wait_for_shutdown() {
+    #[cfg(unix)]
+    {
+        let mut term =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).ok();
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = async { term.as_mut().unwrap().recv().await }, if term.is_some() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
+fn resolve_namespaces(cfg: &Config) -> Result<Namespaces, String> {
+    match &cfg.namespaces {
+        Namespaces::PodNamespace => {
+            let ns = std::fs::read_to_string(Path::new(SA_NAMESPACE_FILE))
+                .map_err(|e| format!("read {SA_NAMESPACE_FILE}: {e}"))?;
+            let ns = ns.trim();
+            if ns.is_empty() {
+                return Err("service-account namespace file is empty".into());
+            }
+            Ok(Namespaces::List(vec![ns.to_string()]))
+        }
+        other => Ok(other.clone()),
+    }
+}
+
+async fn build_client(cfg: &Config) -> Result<Client, String> {
+    let mut kcfg = match &cfg.kubeconfig {
+        Some(path) => {
+            let kc = kube::config::Kubeconfig::read_from(path)
+                .map_err(|e| format!("kubeconfig {path}: {e}"))?;
+            kube::Config::from_custom_kubeconfig(kc, &kube::config::KubeConfigOptions::default())
+                .await
+                .map_err(|e| e.to_string())?
+        }
+        None => kube::Config::infer().await.map_err(|e| e.to_string())?,
+    };
+    if cfg.skip_tls_verify {
+        kcfg.accept_invalid_certs = true;
+    }
+    kcfg.read_timeout = Some(Duration::from_secs(cfg.watch_client_timeout));
+    Client::try_from(kcfg).map_err(|e| e.to_string())
+}
+
+/// reqwest client rooted on bundled webpki roots — the scratch image ships no
+/// CA bundle. `REQ_SKIP_TLS_VERIFY` disables verification for REQ_URL/*.url
+/// calls only (kube API TLS is governed by SKIP_TLS_VERIFY).
+fn build_http_client(cfg: &Config) -> Result<reqwest::Client, String> {
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let mut roots = rustls::RootCertStore::empty();
+    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    let tls = rustls::ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .map_err(|e| e.to_string())?
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    reqwest::Client::builder()
+        .use_preconfigured_tls(tls)
+        .danger_accept_invalid_certs(cfg.req_skip_tls_verify)
+        .build()
+        .map_err(|e| e.to_string())
+}
+
+/// `.url` key downloads — same shared HTTP session semantics as upstream:
+/// GET with the REQ_* auth/retry/timeout budget; response bodies are written
+/// verbatim (including 4xx); 5xx bodies are only written when ENABLE_5XX.
+struct HttpFetcher {
+    http: reqwest::Client,
+    settings: config::FetchSettings,
+}
+
+impl UrlFetcher for HttpFetcher {
+    async fn fetch(&self, url: &str, _binary: bool) -> Result<Vec<u8>, String> {
+        let retries = &self.settings.retries;
+        let mut delay = Duration::ZERO;
+        for attempt in 0..=retries.total {
+            if attempt > 0 {
+                tokio::time::sleep(delay).await;
+            }
+            let mut req = self.http.get(url).timeout(self.settings.timeout);
+            if let Some(h) = reload::basic_auth_header(&self.settings) {
+                req = req.header(reqwest::header::AUTHORIZATION, h);
+            }
+            match req.send().await {
+                Ok(resp) => {
+                    if resp.status().is_server_error() && !self.settings.enable_5xx {
+                        if attempt < retries.total {
+                            delay = retry_delay(retries, attempt);
+                            continue;
+                        }
+                        return Err(format!("{url} returned {}", resp.status()));
+                    }
+                    return resp
+                        .bytes()
+                        .await
+                        .map(|b| b.to_vec())
+                        .map_err(|e| e.to_string());
+                }
+                Err(e) => {
+                    if attempt < retries.total {
+                        delay = retry_delay(retries, attempt);
+                        continue;
+                    }
+                    return Err(e.to_string());
+                }
+            }
+        }
+        unreachable!()
+    }
+}
+
+fn retry_delay(retries: &RetryConfig, attempt: u32) -> Duration {
+    Duration::from_secs_f64(
+        (retries.backoff_factor * 2f64.powi(attempt.saturating_sub(1) as i32)).max(0.0),
+    )
+}
+
+fn init_logging(cfg: &Config) {
+    let filter = EnvFilter::try_new(&cfg.log_level).unwrap_or_else(|_| EnvFilter::new("info"));
+    match cfg.log_format {
+        LogFormat::Json => tracing_subscriber::fmt()
+            .json()
+            .with_env_filter(filter)
+            .init(),
+        LogFormat::Logfmt => tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_ansi(false)
+            .init(),
+    }
+}

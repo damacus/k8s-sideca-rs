@@ -1,0 +1,800 @@
+//! Environment variable and CLI flag parsing, mirroring kiwigrid/k8s-sidecar
+//! env-var surface (pinned to upstream 1.30.2 / 2.5.0).
+
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::time::Duration;
+
+use thiserror::Error;
+
+pub const DEFAULT_FOLDER_ANNOTATION: &str = "k8s-sidecar-target-directory";
+pub const MANIFEST_FILENAME: &str = ".k8s-sidecar-rs.manifest.json";
+
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum ConfigError {
+    #[error("required environment variable {0} is not set")]
+    Missing(&'static str),
+    #[error("invalid value for {var}: {value}")]
+    Invalid { var: &'static str, value: String },
+    #[error("{0} is not supported by this implementation")]
+    Unsupported(&'static str),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Kind {
+    ConfigMap,
+    Secret,
+}
+
+impl Kind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Kind::ConfigMap => "configmap",
+            Kind::Secret => "secret",
+        }
+    }
+}
+
+impl std::fmt::Display for Kind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Method {
+    /// List once and exit.
+    List,
+    /// List, sleep `SLEEP_TIME`, repeat.
+    Sleep,
+    /// Continuous watch (default for anything unrecognised, like upstream).
+    Watch,
+}
+
+/// Parsed `RESOURCE_NAME` entry: `name`, `kind/name` or `namespace/kind/name`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResourceNameSelector {
+    pub name: String,
+    pub kind: Option<Kind>,
+    pub namespace: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Namespaces {
+    /// Watch all namespaces (single cluster-wide stream per resource kind).
+    All,
+    /// One stream per listed namespace.
+    List(Vec<String>),
+    /// Resolve from the pod service-account namespace file at runtime.
+    PodNamespace,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReqMethod {
+    Get,
+    Post,
+}
+
+/// Basic-auth credential encoding (RFC 7617 leaves it undefined; upstream
+/// defaults to latin1 via `requests`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BasicAuthEncoding {
+    Latin1,
+    Utf8,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum Payload {
+    Json(serde_json::Value),
+    Text(String),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct RetryConfig {
+    pub total: u32,
+    pub connect: u32,
+    pub read: u32,
+    pub backoff_factor: f64,
+}
+
+/// Shared HTTP settings for `REQ_URL` callbacks *and* `*.url` downloads —
+/// upstream uses one `requests` session and the `REQ_*` budget for both.
+/// Parsed even when `REQ_URL` is unset (`*.url` fetching still works).
+#[derive(Debug, Clone, PartialEq)]
+pub struct FetchSettings {
+    pub retries: RetryConfig,
+    pub timeout: Duration,
+    pub username: Option<String>,
+    pub password: Option<String>,
+    pub username_file: Option<PathBuf>,
+    pub password_file: Option<PathBuf>,
+    pub basic_auth_encoding: BasicAuthEncoding,
+    /// Write 5xx response bodies instead of treating them as failures (`.url`
+    /// fetches), and do not retry them.
+    pub enable_5xx: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ReqConfig {
+    pub url: String,
+    pub method: ReqMethod,
+    pub payload: Option<Payload>,
+    pub skip_init: bool,
+    pub common: FetchSettings,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LogFormat {
+    Json,
+    Logfmt,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Config {
+    pub label: String,
+    pub label_value: Option<String>,
+    pub folder: PathBuf,
+    pub folder_annotation: String,
+    pub folder_per_namespace: bool,
+    pub namespaces: Namespaces,
+    pub resources: Vec<Kind>,
+    pub resource_names: Vec<ResourceNameSelector>,
+    pub method: Method,
+    pub sleep_time: Duration,
+    pub error_throttle_sleep: Duration,
+    pub req: Option<ReqConfig>,
+    /// HTTP settings for `*.url` downloads (and shared by `req` when set).
+    pub fetch: FetchSettings,
+    /// Skip TLS verification for Kubernetes API calls (`SKIP_TLS_VERIFY`).
+    pub skip_tls_verify: bool,
+    /// Skip TLS verification for `REQ_URL`/`*.url` HTTP calls
+    /// (`REQ_SKIP_TLS_VERIFY`).
+    pub req_skip_tls_verify: bool,
+    pub unique_filenames: bool,
+    pub default_file_mode: Option<u32>,
+    pub kubeconfig: Option<String>,
+    pub watch_server_timeout: u64,
+    pub watch_client_timeout: u64,
+    pub ignore_already_processed: bool,
+    pub health_port: u16,
+    pub log_level: String,
+    pub log_format: LogFormat,
+    pub log_tz_utc: bool,
+}
+
+impl Config {
+    /// Effective method for one concrete namespace ("ALL" is passed verbatim).
+    /// Upstream: `SLEEP` mode, or `RESOURCE_NAME` set on a namespaced stream,
+    /// polls via repeated list instead of watching.
+    pub fn effective_method(&self, namespace: &str) -> Method {
+        if self.method == Method::Sleep || (namespace != "ALL" && !self.resource_names.is_empty()) {
+            Method::Sleep
+        } else {
+            self.method
+        }
+    }
+
+    /// `RESOURCE_NAME` entries applicable to one (kind, namespace) stream.
+    pub fn resource_names_for(&self, kind: Kind, namespace: &str) -> Vec<String> {
+        self.resource_names
+            .iter()
+            .filter(|s| s.namespace.as_deref().is_none_or(|n| n == namespace))
+            .filter(|s| s.kind.is_none_or(|k| k == kind))
+            .map(|s| s.name.clone())
+            .collect()
+    }
+}
+
+fn parse_bool(value: Option<&String>) -> bool {
+    value.is_some_and(|v| v.eq_ignore_ascii_case("true"))
+}
+
+fn parse_u64(
+    env: &HashMap<String, String>,
+    var: &'static str,
+    default: u64,
+) -> Result<u64, ConfigError> {
+    match env.get(var) {
+        None => Ok(default),
+        Some(v) => v.parse().map_err(|_| ConfigError::Invalid {
+            var,
+            value: v.clone(),
+        }),
+    }
+}
+
+fn parse_f64(
+    env: &HashMap<String, String>,
+    var: &'static str,
+    default: f64,
+) -> Result<f64, ConfigError> {
+    match env.get(var) {
+        None => Ok(default),
+        Some(v) => v.parse().map_err(|_| ConfigError::Invalid {
+            var,
+            value: v.clone(),
+        }),
+    }
+}
+
+fn parse_u32(
+    env: &HashMap<String, String>,
+    var: &'static str,
+    default: u32,
+) -> Result<u32, ConfigError> {
+    match env.get(var) {
+        None => Ok(default),
+        Some(v) => v.parse().map_err(|_| ConfigError::Invalid {
+            var,
+            value: v.clone(),
+        }),
+    }
+}
+
+fn parse_resource_name(value: &str) -> Result<ResourceNameSelector, ConfigError> {
+    let mut parts: Vec<&str> = value.rsplitn(3, '/').collect();
+    parts.reverse();
+    match parts.as_slice() {
+        [name] => Ok(ResourceNameSelector {
+            name: (*name).to_string(),
+            kind: None,
+            namespace: None,
+        }),
+        [kind, name] => {
+            let kind = match *kind {
+                "configmap" | "configmaps" => Kind::ConfigMap,
+                "secret" | "secrets" => Kind::Secret,
+                _ => {
+                    return Err(ConfigError::Invalid {
+                        var: "RESOURCE_NAME",
+                        value: value.to_string(),
+                    });
+                }
+            };
+            Ok(ResourceNameSelector {
+                name: (*name).to_string(),
+                kind: Some(kind),
+                namespace: None,
+            })
+        }
+        [ns, kind, name] => {
+            let kind = match *kind {
+                "configmap" | "configmaps" => Kind::ConfigMap,
+                "secret" | "secrets" => Kind::Secret,
+                _ => {
+                    return Err(ConfigError::Invalid {
+                        var: "RESOURCE_NAME",
+                        value: value.to_string(),
+                    });
+                }
+            };
+            Ok(ResourceNameSelector {
+                name: (*name).to_string(),
+                kind: Some(kind),
+                namespace: Some((*ns).to_string()),
+            })
+        }
+        _ => Err(ConfigError::Invalid {
+            var: "RESOURCE_NAME",
+            value: value.to_string(),
+        }),
+    }
+}
+
+fn parse_file_mode(env: &HashMap<String, String>) -> Result<Option<u32>, ConfigError> {
+    match env.get("DEFAULT_FILE_MODE") {
+        None => Ok(None),
+        Some(v) => {
+            if v.len() != 3 || !v.chars().all(|c| ('0'..='7').contains(&c)) {
+                return Err(ConfigError::Invalid {
+                    var: "DEFAULT_FILE_MODE",
+                    value: v.clone(),
+                });
+            }
+            u32::from_str_radix(v, 8)
+                .map(Some)
+                .map_err(|_| ConfigError::Invalid {
+                    var: "DEFAULT_FILE_MODE",
+                    value: v.clone(),
+                })
+        }
+    }
+}
+
+fn parse_payload(raw: &str) -> Payload {
+    match serde_json::from_str(raw) {
+        Ok(v) => Payload::Json(v),
+        Err(_) => Payload::Text(raw.to_string()),
+    }
+}
+
+fn parse_args(args: &[String]) -> HashMap<String, String> {
+    // Upstream uses argparse with --req-username-file / --req-password-file.
+    let mut out = HashMap::new();
+    let mut i = 0;
+    while i < args.len() {
+        if let Some((key, inline)) = args[i].split_once('=') {
+            out.insert(key.to_string(), inline.to_string());
+        } else if i + 1 < args.len() {
+            out.insert(args[i].clone(), args[i + 1].clone());
+            i += 1;
+        }
+        i += 1;
+    }
+    out
+}
+
+/// Build a Config from an environment map and CLI args (injectable for tests).
+pub fn load(env: &HashMap<String, String>, args: &[String]) -> Result<Config, ConfigError> {
+    // Deliberate unsupported features — fail loudly rather than silently
+    // dropping behaviour a deployment relies on.
+    if env.get("SCRIPT").is_some_and(|v| !v.is_empty()) {
+        return Err(ConfigError::Unsupported("SCRIPT"));
+    }
+    if parse_bool(env.get("DISABLE_X509_STRICT_VERIFICATION")) {
+        return Err(ConfigError::Unsupported("DISABLE_X509_STRICT_VERIFICATION"));
+    }
+
+    let label = env
+        .get("LABEL")
+        .filter(|v| !v.is_empty())
+        .cloned()
+        .ok_or(ConfigError::Missing("LABEL"))?;
+    let folder = env
+        .get("FOLDER")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .ok_or(ConfigError::Missing("FOLDER"))?;
+
+    let label_value = env.get("LABEL_VALUE").filter(|v| !v.is_empty()).cloned();
+    let folder_annotation = env
+        .get("FOLDER_ANNOTATION")
+        .filter(|v| !v.is_empty())
+        .cloned()
+        .unwrap_or_else(|| DEFAULT_FOLDER_ANNOTATION.to_string());
+    let folder_per_namespace = parse_bool(env.get("FOLDER_PER_NAMESPACE"));
+
+    let namespaces = match env.get("NAMESPACE").filter(|v| !v.is_empty()) {
+        None => Namespaces::PodNamespace,
+        Some(v) if v == "ALL" => Namespaces::All,
+        Some(v) => Namespaces::List(v.split(',').map(|s| s.trim().to_string()).collect()),
+    };
+
+    let resources = match env
+        .get("RESOURCE")
+        .map(String::as_str)
+        .unwrap_or("configmap")
+    {
+        "configmap" => vec![Kind::ConfigMap],
+        "secret" => vec![Kind::Secret],
+        // Upstream iterates ("secret", "configmap") for `both`.
+        "both" => vec![Kind::Secret, Kind::ConfigMap],
+        other => {
+            return Err(ConfigError::Invalid {
+                var: "RESOURCE",
+                value: other.to_string(),
+            });
+        }
+    };
+
+    let resource_names = env
+        .get("RESOURCE_NAME")
+        .map(|v| {
+            v.split(',')
+                .filter(|s| !s.trim().is_empty())
+                .map(|s| parse_resource_name(s.trim()))
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .transpose()?
+        .unwrap_or_default();
+
+    let method = match env.get("METHOD").map(String::as_str) {
+        Some("LIST") => Method::List,
+        Some("SLEEP") => Method::Sleep,
+        _ => Method::Watch,
+    };
+
+    let cli = parse_args(args);
+    let username_file = cli
+        .get("--req-username-file")
+        .or_else(|| env.get("REQ_USERNAME_FILE"))
+        .map(PathBuf::from);
+    let password_file = cli
+        .get("--req-password-file")
+        .or_else(|| env.get("REQ_PASSWORD_FILE"))
+        .map(PathBuf::from);
+
+    let basic_auth_encoding = match env.get("REQ_BASIC_AUTH_ENCODING").map(String::as_str) {
+        None | Some("latin1") | Some("latin-1") | Some("iso-8859-1") => BasicAuthEncoding::Latin1,
+        Some("utf-8") | Some("utf8") => BasicAuthEncoding::Utf8,
+        Some(other) => {
+            return Err(ConfigError::Invalid {
+                var: "REQ_BASIC_AUTH_ENCODING",
+                value: other.to_string(),
+            });
+        }
+    };
+    let fetch = FetchSettings {
+        username: env.get("REQ_USERNAME").cloned(),
+        password: env.get("REQ_PASSWORD").cloned(),
+        username_file,
+        password_file,
+        basic_auth_encoding,
+        enable_5xx: parse_bool(env.get("ENABLE_5XX")),
+        retries: RetryConfig {
+            total: parse_u32(env, "REQ_RETRY_TOTAL", 5)?,
+            connect: parse_u32(env, "REQ_RETRY_CONNECT", 10)?,
+            read: parse_u32(env, "REQ_RETRY_READ", 5)?,
+            backoff_factor: parse_f64(env, "REQ_RETRY_BACKOFF_FACTOR", 1.1)?,
+        },
+        timeout: Duration::from_secs_f64(parse_f64(env, "REQ_TIMEOUT", 10.0)?),
+    };
+
+    let req = match env.get("REQ_URL").filter(|v| !v.is_empty()) {
+        None => None,
+        Some(url) => {
+            let method = match env.get("REQ_METHOD").map(String::as_str) {
+                None | Some("GET") => ReqMethod::Get,
+                Some("POST") => ReqMethod::Post,
+                Some(other) => {
+                    return Err(ConfigError::Invalid {
+                        var: "REQ_METHOD",
+                        value: other.to_string(),
+                    });
+                }
+            };
+            Some(ReqConfig {
+                url: url.clone(),
+                method,
+                payload: env.get("REQ_PAYLOAD").map(|p| parse_payload(p)),
+                skip_init: parse_bool(env.get("REQ_SKIP_INIT")),
+                common: fetch.clone(),
+            })
+        }
+    };
+
+    let log_format = match env.get("LOG_FORMAT").map(String::as_str) {
+        None | Some("JSON") => LogFormat::Json,
+        Some("LOGFMT") => LogFormat::Logfmt,
+        Some(other) => {
+            return Err(ConfigError::Invalid {
+                var: "LOG_FORMAT",
+                value: other.to_string(),
+            });
+        }
+    };
+
+    Ok(Config {
+        label,
+        label_value,
+        folder,
+        folder_annotation,
+        folder_per_namespace,
+        namespaces,
+        resources,
+        resource_names,
+        method,
+        sleep_time: Duration::from_secs(parse_u64(env, "SLEEP_TIME", 60)?),
+        error_throttle_sleep: Duration::from_secs(parse_u64(env, "ERROR_THROTTLE_SLEEP", 5)?),
+        req,
+        fetch,
+        skip_tls_verify: parse_bool(env.get("SKIP_TLS_VERIFY")),
+        req_skip_tls_verify: parse_bool(env.get("REQ_SKIP_TLS_VERIFY")),
+        unique_filenames: parse_bool(env.get("UNIQUE_FILENAMES")),
+        default_file_mode: parse_file_mode(env)?,
+        kubeconfig: env.get("KUBECONFIG").cloned(),
+        watch_server_timeout: parse_u64(env, "WATCH_SERVER_TIMEOUT", 60)?,
+        watch_client_timeout: parse_u64(env, "WATCH_CLIENT_TIMEOUT", 66)?,
+        ignore_already_processed: parse_bool(env.get("IGNORE_ALREADY_PROCESSED")),
+        health_port: parse_u64(env, "HEALTH_PORT", 8080)? as u16,
+        log_level: env
+            .get("LOG_LEVEL")
+            .cloned()
+            .unwrap_or_else(|| "INFO".into()),
+        log_format,
+        log_tz_utc: env.get("LOG_TZ").is_some_and(|v| v == "UTC"),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn env(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    fn base() -> HashMap<String, String> {
+        env(&[
+            ("LABEL", "grafana_dashboard"),
+            ("FOLDER", "/tmp/dashboards"),
+        ])
+    }
+
+    #[test]
+    fn missing_label_fails() {
+        let e = env(&[("FOLDER", "/tmp")]);
+        assert_eq!(load(&e, &[]), Err(ConfigError::Missing("LABEL")));
+    }
+
+    #[test]
+    fn missing_folder_fails() {
+        let e = env(&[("LABEL", "x")]);
+        assert_eq!(load(&e, &[]), Err(ConfigError::Missing("FOLDER")));
+    }
+
+    #[test]
+    fn defaults_match_upstream() {
+        let cfg = load(&base(), &[]).unwrap();
+        assert_eq!(cfg.folder_annotation, "k8s-sidecar-target-directory");
+        assert_eq!(cfg.namespaces, Namespaces::PodNamespace);
+        assert_eq!(cfg.resources, vec![Kind::ConfigMap]);
+        assert_eq!(cfg.method, Method::Watch);
+        assert_eq!(cfg.sleep_time, Duration::from_secs(60));
+        assert_eq!(cfg.error_throttle_sleep, Duration::from_secs(5));
+        assert_eq!(cfg.watch_server_timeout, 60);
+        assert_eq!(cfg.watch_client_timeout, 66);
+        assert_eq!(cfg.health_port, 8080);
+        assert!(!cfg.unique_filenames);
+        assert!(!cfg.ignore_already_processed);
+        assert_eq!(cfg.default_file_mode, None);
+        assert!(cfg.req.is_none());
+    }
+
+    #[test]
+    fn resource_both_orders_secret_first() {
+        let e = env(&[("LABEL", "x"), ("FOLDER", "/tmp"), ("RESOURCE", "both")]);
+        assert_eq!(
+            load(&e, &[]).unwrap().resources,
+            vec![Kind::Secret, Kind::ConfigMap]
+        );
+    }
+
+    #[test]
+    fn invalid_resource_fails() {
+        let e = env(&[("LABEL", "x"), ("FOLDER", "/tmp"), ("RESOURCE", "pod")]);
+        assert!(matches!(
+            load(&e, &[]),
+            Err(ConfigError::Invalid {
+                var: "RESOURCE",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn namespace_all_and_list() {
+        let e = env(&[("LABEL", "x"), ("FOLDER", "/tmp"), ("NAMESPACE", "ALL")]);
+        assert_eq!(load(&e, &[]).unwrap().namespaces, Namespaces::All);
+        let e = env(&[("LABEL", "x"), ("FOLDER", "/tmp"), ("NAMESPACE", "a, b")]);
+        assert_eq!(
+            load(&e, &[]).unwrap().namespaces,
+            Namespaces::List(vec!["a".into(), "b".into()])
+        );
+    }
+
+    #[test]
+    fn method_list_and_sleep() {
+        let e = env(&[("LABEL", "x"), ("FOLDER", "/tmp"), ("METHOD", "LIST")]);
+        assert_eq!(load(&e, &[]).unwrap().method, Method::List);
+        let e = env(&[("LABEL", "x"), ("FOLDER", "/tmp"), ("METHOD", "SLEEP")]);
+        assert_eq!(load(&e, &[]).unwrap().method, Method::Sleep);
+        // Anything else is a watch, like upstream.
+        let e = env(&[("LABEL", "x"), ("FOLDER", "/tmp"), ("METHOD", "bogus")]);
+        assert_eq!(load(&e, &[]).unwrap().method, Method::Watch);
+    }
+
+    #[test]
+    fn resource_name_parsing() {
+        let e = env(&[
+            ("LABEL", "x"),
+            ("FOLDER", "/tmp"),
+            ("RESOURCE_NAME", "plain,secret/s,ns/configmap/cm"),
+        ]);
+        let cfg = load(&e, &[]).unwrap();
+        assert_eq!(
+            cfg.resource_names,
+            vec![
+                ResourceNameSelector {
+                    name: "plain".into(),
+                    kind: None,
+                    namespace: None
+                },
+                ResourceNameSelector {
+                    name: "s".into(),
+                    kind: Some(Kind::Secret),
+                    namespace: None
+                },
+                ResourceNameSelector {
+                    name: "cm".into(),
+                    kind: Some(Kind::ConfigMap),
+                    namespace: Some("ns".into())
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn resource_name_forces_sleep_per_namespace() {
+        let e = env(&[("LABEL", "x"), ("FOLDER", "/tmp"), ("RESOURCE_NAME", "cm1")]);
+        let cfg = load(&e, &[]).unwrap();
+        assert_eq!(cfg.method, Method::Watch);
+        assert_eq!(cfg.effective_method("myns"), Method::Sleep);
+        // Cluster-wide stream ignores RESOURCE_NAME like upstream.
+        assert_eq!(cfg.effective_method("ALL"), Method::Watch);
+    }
+
+    #[test]
+    fn resource_names_for_filters_kind_and_namespace() {
+        let e = env(&[
+            ("LABEL", "x"),
+            ("FOLDER", "/tmp"),
+            (
+                "RESOURCE_NAME",
+                "a,secret/s1,ns1/configmap/cm1,ns2/configmap/cm2",
+            ),
+        ]);
+        let cfg = load(&e, &[]).unwrap();
+        assert_eq!(
+            cfg.resource_names_for(Kind::ConfigMap, "ns1"),
+            vec!["a".to_string(), "cm1".to_string()]
+        );
+        assert_eq!(
+            cfg.resource_names_for(Kind::Secret, "ns1"),
+            vec!["a".to_string(), "s1".to_string()]
+        );
+        assert_eq!(
+            cfg.resource_names_for(Kind::ConfigMap, "ns2"),
+            vec!["a".to_string(), "cm2".to_string()]
+        );
+    }
+
+    #[test]
+    fn script_is_unsupported() {
+        let e = env(&[("LABEL", "x"), ("FOLDER", "/tmp"), ("SCRIPT", "/x.sh")]);
+        assert_eq!(load(&e, &[]), Err(ConfigError::Unsupported("SCRIPT")));
+    }
+
+    #[test]
+    fn strict_x509_disable_is_unsupported() {
+        let e = env(&[
+            ("LABEL", "x"),
+            ("FOLDER", "/tmp"),
+            ("DISABLE_X509_STRICT_VERIFICATION", "true"),
+        ]);
+        assert_eq!(
+            load(&e, &[]),
+            Err(ConfigError::Unsupported("DISABLE_X509_STRICT_VERIFICATION"))
+        );
+    }
+
+    #[test]
+    fn file_mode_must_be_octal_triplet() {
+        let e = env(&[
+            ("LABEL", "x"),
+            ("FOLDER", "/tmp"),
+            ("DEFAULT_FILE_MODE", "640"),
+        ]);
+        assert_eq!(load(&e, &[]).unwrap().default_file_mode, Some(0o640));
+        let e = env(&[
+            ("LABEL", "x"),
+            ("FOLDER", "/tmp"),
+            ("DEFAULT_FILE_MODE", "999"),
+        ]);
+        assert!(matches!(
+            load(&e, &[]),
+            Err(ConfigError::Invalid {
+                var: "DEFAULT_FILE_MODE",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn req_config_full_surface() {
+        let e = env(&[
+            ("LABEL", "x"),
+            ("FOLDER", "/tmp"),
+            (
+                "REQ_URL",
+                "http://grafana:3000/api/admin/provisioning/dashboards/reload",
+            ),
+            ("REQ_METHOD", "POST"),
+            ("REQ_PAYLOAD", "{\"k\": 1}"),
+            ("REQ_USERNAME", "u"),
+            ("REQ_PASSWORD", "p"),
+            ("REQ_SKIP_INIT", "true"),
+            ("ENABLE_5XX", "true"),
+            ("REQ_RETRY_TOTAL", "7"),
+            ("REQ_TIMEOUT", "2.5"),
+        ]);
+        let cfg = load(&e, &[]).unwrap();
+        let req = cfg.req.unwrap();
+        assert_eq!(req.method, ReqMethod::Post);
+        assert_eq!(req.common.username.as_deref(), Some("u"));
+        assert!(req.skip_init);
+        assert!(req.common.enable_5xx);
+        assert_eq!(req.common.retries.total, 7);
+        assert_eq!(req.common.retries.connect, 10);
+        assert_eq!(req.common.timeout, Duration::from_millis(2500));
+        assert!(matches!(req.payload, Some(Payload::Json(_))));
+    }
+
+    #[test]
+    fn req_payload_non_json_becomes_text() {
+        let e = env(&[
+            ("LABEL", "x"),
+            ("FOLDER", "/tmp"),
+            ("REQ_URL", "http://x"),
+            ("REQ_PAYLOAD", "not json {"),
+        ]);
+        let req = load(&e, &[]).unwrap().req.unwrap();
+        assert!(matches!(req.payload, Some(Payload::Text(ref t)) if t == "not json {"));
+    }
+
+    #[test]
+    fn req_method_invalid_fails() {
+        let e = env(&[
+            ("LABEL", "x"),
+            ("FOLDER", "/tmp"),
+            ("REQ_URL", "http://x"),
+            ("REQ_METHOD", "DELETE"),
+        ]);
+        assert!(matches!(
+            load(&e, &[]),
+            Err(ConfigError::Invalid {
+                var: "REQ_METHOD",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn credential_file_precedence_flag_then_env() {
+        let e = env(&[
+            ("LABEL", "x"),
+            ("FOLDER", "/tmp"),
+            ("REQ_URL", "http://x"),
+            ("REQ_USERNAME_FILE", "/env/user"),
+        ]);
+        let args = vec!["--req-username-file".to_string(), "/cli/user".to_string()];
+        let req = load(&e, &args).unwrap().req.unwrap();
+        // CLI flag wins over env (upstream only had the flag at 2.5.0).
+        assert_eq!(req.common.username_file, Some(PathBuf::from("/cli/user")));
+    }
+
+    #[test]
+    fn basic_auth_encoding_latin1_default() {
+        let e = env(&[("LABEL", "x"), ("FOLDER", "/tmp"), ("REQ_URL", "http://x")]);
+        let req = load(&e, &[]).unwrap().req.unwrap();
+        assert_eq!(req.common.basic_auth_encoding, BasicAuthEncoding::Latin1);
+        let e = env(&[
+            ("LABEL", "x"),
+            ("FOLDER", "/tmp"),
+            ("REQ_URL", "http://x"),
+            ("REQ_BASIC_AUTH_ENCODING", "utf-8"),
+        ]);
+        assert_eq!(
+            load(&e, &[])
+                .unwrap()
+                .req
+                .unwrap()
+                .common
+                .basic_auth_encoding,
+            BasicAuthEncoding::Utf8
+        );
+    }
+
+    #[test]
+    fn folder_per_namespace_flag() {
+        let e = env(&[
+            ("LABEL", "x"),
+            ("FOLDER", "/tmp"),
+            ("FOLDER_PER_NAMESPACE", "true"),
+        ]);
+        assert!(load(&e, &[]).unwrap().folder_per_namespace);
+    }
+}
