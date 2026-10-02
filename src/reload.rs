@@ -44,6 +44,24 @@ impl Reloader {
         self.applied.load(Ordering::SeqCst)
     }
 
+    /// Fire the callback once if a generation is pending. METHOD=LIST never
+    /// runs the loop — without this the pending callback was silently dropped
+    /// on exit.
+    pub async fn flush(&self) {
+        let pending = self.pending.load(Ordering::SeqCst);
+        if pending <= self.applied.load(Ordering::SeqCst) {
+            return;
+        }
+        match self.attempt().await {
+            Ok(()) => {
+                self.applied.store(pending, Ordering::SeqCst);
+            }
+            Err(e) => {
+                error!(url = %self.cfg.url, error = %e, "reload callback failed");
+            }
+        }
+    }
+
     pub async fn run(self: Arc<Self>, cancel: CancellationToken, retry_pause: Duration) {
         loop {
             let pending = self.pending.load(Ordering::SeqCst);
@@ -363,6 +381,22 @@ mod tests {
         let body = req.split("\r\n\r\n").nth(1).unwrap();
         assert_eq!(body, "{\"a\":1}");
         assert!(head.contains("content-type: application/json"));
+    }
+
+    #[tokio::test]
+    async fn flush_delivers_pending_generation_once() {
+        // METHOD=LIST never runs the reloader loop — flush() is its exit path.
+        let hits = Arc::new(AtomicUsize::new(0));
+        let url = serve(vec![200], hits.clone());
+        let r = Reloader::new(cfg(url), client());
+        r.flush().await;
+        assert_eq!(hits.load(Ordering::SeqCst), 0);
+        r.bump();
+        r.flush().await;
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        assert_eq!(r.applied(), 1);
+        r.flush().await;
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
