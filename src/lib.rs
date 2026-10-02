@@ -4,5 +4,6 @@
 pub mod config;
 pub mod files;
 pub mod health;
+pub mod http;
 pub mod reload;
 pub mod watch;
