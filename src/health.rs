@@ -100,15 +100,32 @@ pub async fn serve(state: Arc<HealthState>, port: u16, cancel: CancellationToken
     };
     info!(port, "health server listening");
 
-    // Translate blocking accept into tokio via a blocking task bridge.
+    // Translate accept into tokio via a blocking thread + channel. The
+    // listener is nonblocking so the thread can observe cancellation even
+    // when no probes are arriving — a blocking accept() would otherwise
+    // leak the thread (and the bound port) past shutdown.
+    if let Err(e) = listener.set_nonblocking(true) {
+        error!(port, error = %e, "health server failed to configure listener");
+        return;
+    }
     let (tx, mut rx) = tokio::sync::mpsc::channel::<std::net::TcpStream>(16);
-    std::thread::spawn(move || {
+    let accept_cancel = cancel.clone();
+    let accept_thread = std::thread::spawn(move || {
         loop {
             match listener.accept() {
                 Ok((s, _)) => {
+                    // Accepted sockets may inherit nonblocking mode depending on
+                    // the platform; handle() needs blocking reads with a timeout.
+                    let _ = s.set_nonblocking(false);
                     if tx.blocking_send(s).is_err() {
                         return;
                     }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    if accept_cancel.is_cancelled() {
+                        return;
+                    }
+                    std::thread::sleep(Duration::from_millis(50));
                 }
                 Err(_) => return,
             }
@@ -117,7 +134,7 @@ pub async fn serve(state: Arc<HealthState>, port: u16, cancel: CancellationToken
 
     loop {
         tokio::select! {
-            _ = cancel.cancelled() => return,
+            _ = cancel.cancelled() => break,
             Some(stream) = rx.recv() => {
                 let st = state.clone();
                 tokio::spawn(async move {
@@ -126,6 +143,9 @@ pub async fn serve(state: Arc<HealthState>, port: u16, cancel: CancellationToken
             }
         }
     }
+
+    // Wait for the accept thread to notice cancellation and drop the listener.
+    let _ = tokio::task::spawn_blocking(move || accept_thread.join()).await;
 }
 
 fn bind(port: u16) -> Option<TcpListener> {
@@ -270,6 +290,33 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status().as_u16(), 404);
         cancel.cancel();
+    }
+
+    #[tokio::test]
+    async fn cancel_releases_the_listener() {
+        // The accept thread must notice cancellation, exit, and drop the
+        // listener — a leaked thread would keep the port bound forever.
+        let state = HealthState::new(None);
+        state.mark_ready();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let cancel = CancellationToken::new();
+        let server = tokio::spawn(serve(state, port, cancel.clone()));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        cancel.cancel();
+        tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .expect("serve should return once the accept thread exits")
+            .unwrap();
+
+        assert!(
+            tokio::net::TcpStream::connect(("127.0.0.1", port))
+                .await
+                .is_err(),
+            "listener should be released after cancel"
+        );
     }
 
     #[tokio::test]
