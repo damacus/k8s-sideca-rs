@@ -8,7 +8,6 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
-use std::time::Duration;
 
 use futures_util::StreamExt;
 use k8s_openapi::api::core::v1::{ConfigMap, Secret};
@@ -143,8 +142,6 @@ pub async fn run_watcher(ctx: StreamCtx, kind: Kind, namespace: String) {
         }
         ctx.health.stream_dead(&id);
         error!(stream = %id, error = ?result, "watch stream ended; restarting");
-        ctx.health
-            .register_stream(&id, Duration::from_secs(ctx.cfg.watch_server_timeout));
         tokio::select! {
             _ = ctx.cancel.cancelled() => return,
             _ = tokio::time::sleep(ctx.cfg.error_throttle_sleep) => {}
@@ -196,21 +193,34 @@ where
         };
         ctx.health.contact(id);
         let send = match result {
-            Ok(Event::Init) => SyncEvent::InitStart { stream: id.into() },
-            Ok(Event::InitApply(o)) | Ok(Event::Apply(o)) => SyncEvent::Upsert {
-                stream: id.into(),
-                data: ResourceData::from(&o),
-            },
-            Ok(Event::Delete(o)) => SyncEvent::Delete {
-                stream: id.into(),
-                data: ResourceData::from(&o),
-            },
-            Ok(Event::InitDone) => SyncEvent::InitDone { stream: id.into() },
+            Ok(e) => {
+                // Real progress — the only thing allowed to revive liveness.
+                ctx.health.stream_alive(id);
+                map_event(e, id)
+            }
             Err(e) => return Err(e),
         };
         if ctx.tx.send(send).await.is_err() {
             return Ok(());
         }
+    }
+}
+
+fn map_event<T>(event: Event<T>, id: &str) -> SyncEvent
+where
+    for<'a> ResourceData: From<&'a T>,
+{
+    match event {
+        Event::Init => SyncEvent::InitStart { stream: id.into() },
+        Event::InitApply(o) | Event::Apply(o) => SyncEvent::Upsert {
+            stream: id.into(),
+            data: ResourceData::from(&o),
+        },
+        Event::Delete(o) => SyncEvent::Delete {
+            stream: id.into(),
+            data: ResourceData::from(&o),
+        },
+        Event::InitDone => SyncEvent::InitDone { stream: id.into() },
     }
 }
 
