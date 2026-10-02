@@ -409,6 +409,7 @@ pub async fn reconcile_loop<F: UrlFetcher>(
                     st.init_deletes.push(data);
                 } else if let Ok(true) = rec.remove(&data.owner) {
                     st.known.remove(&data.owner.key());
+                    owners.remove(&data.owner.key());
                     if ready {
                         if let Some(r) = &reloader {
                             r.bump();
@@ -422,9 +423,9 @@ pub async fn reconcile_loop<F: UrlFetcher>(
                 st.in_init = false;
                 let mut changed = false;
                 for d in std::mem::take(&mut st.init_deletes) {
-                    owners.insert(d.owner.key(), d.owner.clone());
                     changed |= rec.remove(&d.owner).unwrap_or(false);
                     st.known.remove(&d.owner.key());
+                    owners.remove(&d.owner.key());
                 }
                 // Commit deletions: owners applied by this stream but absent
                 // from the relist are removed now.
@@ -434,6 +435,7 @@ pub async fn reconcile_loop<F: UrlFetcher>(
                         changed |= rec.remove(owner).unwrap_or(false);
                     }
                     st.known.remove(&key);
+                    owners.remove(&key);
                 }
                 st.synced = true;
 
