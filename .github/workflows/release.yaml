@@ -116,7 +116,7 @@ jobs:
           echo "digest=$digest" >> "$GITHUB_OUTPUT"
           echo "IMAGE_DIGEST=$digest" >> "$GITHUB_STEP_SUMMARY"
 
-      - uses: actions/attest-build-provenance@v3
+      - uses: actions/attest-build-provenance@v4
         if: ${{ !github.event.repository.private }}
         with:
           subject-name: ${{ env.IMAGE }}
