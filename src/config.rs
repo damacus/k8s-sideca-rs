@@ -524,13 +524,15 @@ pub fn load(env: &HashMap<String, String>, args: &[String]) -> Result<Config, Co
         }
     };
 
-    let log_format = match env.get("LOG_FORMAT").map(String::as_str) {
-        None | Some("JSON") => LogFormat::Json,
-        Some("LOGFMT") => LogFormat::Logfmt,
-        Some(other) => {
+    // Case-insensitive like upstream's free-form env parsing.
+    let log_format = match env.get("LOG_FORMAT").map(|s| s.to_ascii_uppercase()) {
+        None => LogFormat::Json,
+        Some(ref v) if v == "JSON" => LogFormat::Json,
+        Some(ref v) if v == "LOGFMT" => LogFormat::Logfmt,
+        Some(_) => {
             return Err(ConfigError::Invalid {
                 var: "LOG_FORMAT",
-                value: other.to_string(),
+                value: env.get("LOG_FORMAT").cloned().unwrap_or_default(),
             });
         }
     };
@@ -980,6 +982,20 @@ mod tests {
         assert_eq!(retries.backoff_delay(3), Duration::from_secs_f64(2.0));
         // attempt 0 is not a real call site but must not panic or go negative.
         assert_eq!(retries.backoff_delay(0), Duration::from_secs_f64(0.5));
+    }
+
+    #[test]
+    fn log_format_is_case_insensitive() {
+        for v in ["json", "Json", "JSON", "logfmt", "Logfmt", "LOGFMT"] {
+            let e = env(&[("LABEL", "x"), ("FOLDER", "/tmp"), ("LOG_FORMAT", v)]);
+            let fmt = load(&e, &[]).unwrap().log_format;
+            let expected = if v.eq_ignore_ascii_case("json") {
+                LogFormat::Json
+            } else {
+                LogFormat::Logfmt
+            };
+            assert_eq!(fmt, expected, "LOG_FORMAT={v}");
+        }
     }
 
     #[test]
