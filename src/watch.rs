@@ -382,9 +382,11 @@ pub async fn reconcile_loop<F: UrlFetcher>(
                     continue;
                 }
                 owners.insert(data.owner.key(), data.owner.clone());
+                // The resource was observed in this relist even if apply
+                // fails — otherwise InitDone would delete its owned files.
+                st.init_seen.insert(data.owner.key());
                 match apply_upsert(&mut rec, &cfg, &data, &fetcher).await {
                     Ok(changed) => {
-                        st.init_seen.insert(data.owner.key());
                         st.known.insert(data.owner.key());
                         if changed
                             && ready
@@ -662,6 +664,50 @@ mod tests {
             SyncEvent::Upsert {
                 stream: s.clone(),
                 data: cm("ns", "a", &[("f", "v")]),
+            },
+            SyncEvent::InitDone { stream: s.clone() },
+        ] {
+            h.tx.send(e).await.unwrap();
+        }
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(h.folder.join("f").exists());
+        h.cancel.cancel();
+        let _ = task.await;
+    }
+
+    #[tokio::test]
+    async fn failed_apply_preserves_owned_files() {
+        // A resource whose destination resolution fails (e.g. an annotation
+        // that escapes FOLDER) was still *observed* — its previously-owned
+        // files must not be treated as vanished and deleted at InitDone.
+        let tmp = TempDir::new().unwrap();
+        let c = cfg(&[("LABEL", "x"), ("FOLDER", tmp.path().to_str().unwrap())]);
+        let (h, task) = harness(c, tmp.path(), &["configmap/ns"]).await;
+        let s = "configmap/ns".to_string();
+        for e in [
+            SyncEvent::InitStart { stream: s.clone() },
+            SyncEvent::Upsert {
+                stream: s.clone(),
+                data: cm("ns", "a", &[("f", "v")]),
+            },
+            SyncEvent::InitDone { stream: s.clone() },
+        ] {
+            h.tx.send(e).await.unwrap();
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(h.folder.join("f").exists());
+
+        // Same resource now carries a hostile annotation.
+        let mut bad = cm("ns", "a", &[("f", "v")]);
+        bad.annotations = BTreeMap::from([(
+            "k8s-sidecar-target-directory".to_string(),
+            "../escape".to_string(),
+        )]);
+        for e in [
+            SyncEvent::InitStart { stream: s.clone() },
+            SyncEvent::Upsert {
+                stream: s.clone(),
+                data: bad,
             },
             SyncEvent::InitDone { stream: s.clone() },
         ] {
