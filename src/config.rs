@@ -656,7 +656,9 @@ pub fn load(env: &HashMap<String, String>, args: &[String]) -> Result<Config, Co
             .cloned()
             .unwrap_or_else(|| "INFO".into()),
         log_format,
-        log_tz_utc: env.get("LOG_TZ").is_some_and(|v| v == "UTC"),
+        log_tz_utc: env
+            .get("LOG_TZ")
+            .is_some_and(|v| v.eq_ignore_ascii_case("UTC")),
     })
 }
 
@@ -724,6 +726,21 @@ mod tests {
         e.insert("NAMESPACE".into(), "default".into());
         e.insert("RESOURCE_NAME".into(), "grafana".into());
         assert!(!load(&e, &[]).unwrap().resource_name_ignored());
+    }
+
+    #[test]
+    fn log_tz_utc_is_case_insensitive() {
+        for v in ["UTC", "utc", "Utc"] {
+            let mut e = base();
+            e.insert("LOG_TZ".into(), v.into());
+            assert!(load(&e, &[]).unwrap().log_tz_utc, "LOG_TZ={v}");
+        }
+        for v in ["LOCAL", "local", "Europe/London"] {
+            let mut e = base();
+            e.insert("LOG_TZ".into(), v.into());
+            assert!(!load(&e, &[]).unwrap().log_tz_utc, "LOG_TZ={v}");
+        }
+        assert!(!load(&base(), &[]).unwrap().log_tz_utc);
     }
 
     #[test]
