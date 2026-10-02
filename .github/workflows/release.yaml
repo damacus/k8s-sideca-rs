@@ -3,6 +3,10 @@ name: publish image
 # Called from release-please.yml after a release is cut (releases created by
 # GITHUB_TOKEN do not fire `release: published` workflows), and runnable by
 # hand to republish an existing tag.
+#
+# Per-arch jobs run on native runners (ubuntu-24.04-arm for arm64 — QEMU
+# emulation of a full Rust build takes ~an hour); a merge job assembles the
+# multi-arch manifest, SBOMs and provenance.
 
 on:
   workflow_call:
@@ -44,15 +48,27 @@ permissions:
   id-token: write
   attestations: write
 
+env:
+  IMAGE: ghcr.io/${{ github.repository }}
+
 jobs:
-  image:
-    runs-on: ubuntu-latest
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-latest
+            arch: amd64
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+            arch: arm64
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
         with:
           ref: ${{ inputs.tag }}
 
-      - uses: docker/setup-qemu-action@v3
       - uses: docker/setup-buildx-action@v3
 
       - uses: docker/login-action@v3
@@ -61,35 +77,66 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - uses: docker/metadata-action@v5
-        id: meta
-        with:
-          images: ghcr.io/${{ github.repository }}
-          tags: |
-            type=raw,value=${{ inputs.version }}
-            type=raw,value=${{ inputs.major }}.${{ inputs.minor }}
-            type=raw,value=${{ inputs.major }}
-            type=sha
-
+      # Push by digest; the merge job stitches the multi-arch manifest.
       - uses: docker/build-push-action@v6
         id: build
         with:
           context: .
-          platforms: linux/amd64,linux/arm64
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
+          platforms: ${{ matrix.platform }}
+          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,annotation-index.org.opencontainers.image.source=${{ github.event.repository.html_url }}
           sbom: true
           provenance: mode=max
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-from: type=gha,scope=${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.arch }}
 
-      - name: Record immutable digest
-        run: echo "IMAGE_DIGEST=${{ steps.build.outputs.digest }}" >> "$GITHUB_STEP_SUMMARY"
+      - name: Export digest
+        run: |
+          mkdir -p /tmp/digests
+          echo "${{ steps.build.outputs.digest }}" > "/tmp/digests/${{ matrix.arch }}.txt"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: digest-${{ matrix.arch }}
+          path: /tmp/digests/${{ matrix.arch }}.txt
+          if-no-files-found: error
+          retention-days: 1
+
+  merge:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: digest-*
+          path: /tmp/digests
+          merge-multiple: true
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create multi-arch manifest
+        id: manifest
+        run: |
+          refs=""
+          for f in /tmp/digests/*.txt; do
+            refs="$refs ${{ env.IMAGE }}@$(cat "$f")"
+          done
+          for tag in "${{ inputs.version }}" "${{ inputs.major }}.${{ inputs.minor }}" "${{ inputs.major }}" "sha-${{ github.sha }}"; do
+            docker buildx imagetools create -t "${{ env.IMAGE }}:${tag}" $refs
+          done
+          # Resolve the manifest digest for attestation + summary
+          digest=$(docker buildx imagetools inspect "${{ env.IMAGE }}:${{ inputs.version }}" --format '{{.Manifest.Digest}}')
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+          echo "IMAGE_DIGEST=$digest" >> "$GITHUB_STEP_SUMMARY"
 
       - uses: actions/attest-build-provenance@v3
         if: ${{ !github.event.repository.private }}
         with:
-          subject-name: ghcr.io/${{ github.repository }}
-          subject-digest: ${{ steps.build.outputs.digest }}
+          subject-name: ${{ env.IMAGE }}
+          subject-digest: ${{ steps.manifest.outputs.digest }}
           push-to-registry: true
