@@ -57,6 +57,9 @@ Port in progress — not yet released or deployed.
   file.
 - **Failed reload callbacks stay pending** and are retried; upstream drops them
   after the retry budget is exhausted.
+- **Non-JSON `REQ_PAYLOAD` is sent as `text/plain`** — upstream posts it with
+  `application/json` while quoting the string as JSON. If `REQ_PAYLOAD` parses
+  as JSON it is still sent as `application/json`, matching upstream.
 - **`SCRIPT` is unsupported** — startup fails loudly (no shell in the scratch
   image anyway).
 - **`DISABLE_X509_STRICT_VERIFICATION` is unsupported** — rustls has no
