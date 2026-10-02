@@ -157,6 +157,10 @@ async fn run() -> i32 {
     } else {
         // LIST exits once every stream did a single pass and the queue drains.
         while tasks.join_next().await.is_some() {}
+        // The reloader loop never ran — deliver the pending callback once.
+        if let Some(r) = &reloader {
+            r.flush().await;
+        }
         info!("list pass complete, exiting");
         return 0;
     }
