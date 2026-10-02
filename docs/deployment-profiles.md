@@ -38,10 +38,11 @@ All six: `METHOD=WATCH`, `RESOURCE=both`, `WATCH_SERVER/CLIENT_TIMEOUT=60`
   `sidecar.image` setting, so dashboards+alerts cannot be canaried
   separately via values. Canary needs an isolated deployment or a chart
   change.
-- `openebs-system/openebs-loki`: **not in GitOps** — `helm.sh/chart=loki-6.29.0`,
-  managed-by Helm with stale `helm.toolkit.fluxcd.io/name=openebs` labels.
-  Deployed via raw `helm` (or a retired GitOps path). Migration needs
-  `helm upgrade` or GitOps adoption first; also the oldest skew (1.30.2).
+- `openebs-system/openebs-loki`: rendered by the Flux HelmRelease `openebs`
+  (chart `openebs@4.6.1`) — it embeds `loki` as a subchart (`loki-6.29.0`),
+  which is where the `1.30.2` sidecar default comes from. Override point is
+  the subchart values key `loki.sidecar.image.*` (or a `postRenderers` image
+  rewrite on the `openebs` HR). Oldest version skew (1.30.2).
 
 ## Drift to verify at rollout time
 
