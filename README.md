@@ -1,7 +1,7 @@
 # k8s-sidecar-rs
 
 Rust reimplementation of [kiwigrid/k8s-sidecar](https://github.com/kiwigrid/k8s-sidecar)
-(pinned compatibility targets: upstream `1.30.2` and `2.5.0`).
+(pinned compatibility target: upstream `2.11.2`).
 
 Watches ConfigMaps and Secrets matching a label, writes their data to a shared
 folder atomically, and optionally calls an HTTP endpoint when files change.
@@ -12,27 +12,28 @@ Port in progress — not yet released or deployed.
 
 ## Supported configuration
 
-| Variable | Notes |
-|---|---|
-| `LABEL`, `LABEL_VALUE` | required label selector |
-| `FOLDER` | required destination root |
-| `FOLDER_ANNOTATION` | per-resource folder override (default `k8s-sidecar-target-directory`) |
-| `FOLDER_PER_NAMESPACE` | append namespace to destination (upstream ≥ 2.11.0 feature) |
-| `NAMESPACE` | comma list, `ALL`, or pod namespace default |
-| `RESOURCE` | `configmap`, `secret`, `both` |
-| `RESOURCE_NAME` | `name`, `kind/name`, `ns/kind/name`; forces SLEEP-style polling per namespace |
-| `METHOD` | `LIST` (once, exit), `SLEEP` (poll every `SLEEP_TIME`), default WATCH |
-| `SLEEP_TIME`, `ERROR_THROTTLE_SLEEP` | poll / error-backoff seconds |
-| `REQ_URL`, `REQ_METHOD`, `REQ_PAYLOAD` | reload callback |
-| `REQ_USERNAME`, `REQ_PASSWORD`, `REQ_USERNAME_FILE`, `REQ_PASSWORD_FILE`, `--req-username-file`, `--req-password-file` | basic auth; files re-read per attempt |
-| `REQ_BASIC_AUTH_ENCODING` | `latin1` (default) or `utf-8` |
-| `REQ_RETRY_*`, `REQ_TIMEOUT`, `REQ_SKIP_INIT`, `REQ_SKIP_TLS_VERIFY` | shared HTTP budget (also used for `*.url` downloads) |
-| `ENABLE_5XX`, `UNIQUE_FILENAMES`, `DEFAULT_FILE_MODE` | |
-| `SKIP_TLS_VERIFY`, `KUBECONFIG` | Kubernetes client |
-| `WATCH_SERVER_TIMEOUT`, `WATCH_CLIENT_TIMEOUT` | server `timeoutSeconds` / client read timeout |
-| `IGNORE_ALREADY_PROCESSED` | dedupe on resourceVersion |
-| `HEALTH_PORT` | `/healthz` (default 8080) |
-| `LOG_LEVEL`, `LOG_FORMAT`, `LOG_TZ` | `JSON`/`LOGFMT` |
+| Variable                                                                                                               | Notes                                                                             |
+|------------------------------------------------------------------------------------------------------------------------|-----------------------------------------------------------------------------------|
+| `LABEL`, `LABEL_VALUE`                                                                                                 | required label selector                                                           |
+| `FOLDER`                                                                                                               | required destination root                                                         |
+| `FOLDER_ANNOTATION`                                                                                                    | per-resource folder override (default `k8s-sidecar-target-directory`)             |
+| `FOLDER_PER_NAMESPACE`                                                                                                 | `FOLDER/<ns>`; relative annotation → `FOLDER/<ns>/<ann>`; absolute stays verbatim |
+| `NAMESPACE`                                                                                                            | comma list, `ALL`, or pod namespace default                                       |
+| `RESOURCE`                                                                                                             | `configmap`, `secret`, `both`                                                     |
+| `RESOURCE_NAME`                                                                                                        | `name`, `kind/name`, `ns/kind/name`; forces SLEEP-style polling per namespace     |
+| `METHOD`                                                                                                               | `LIST` (once, exit), `SLEEP` (poll every `SLEEP_TIME`), default WATCH             |
+| `SLEEP_TIME`, `ERROR_THROTTLE_SLEEP`                                                                                   | poll / error-backoff seconds                                                      |
+| `REQ_URL`, `REQ_METHOD`, `REQ_PAYLOAD`                                                                                 | reload callback                                                                   |
+| `REQ_USERNAME`, `REQ_PASSWORD`, `REQ_USERNAME_FILE`, `REQ_PASSWORD_FILE`, `--req-username-file`, `--req-password-file` | basic auth; files re-read per attempt                                             |
+| `REQ_BASIC_AUTH_ENCODING`                                                                                              | `latin1` (default) or `utf-8`                                                     |
+| `REQ_RETRY_*`, `REQ_TIMEOUT`, `REQ_SKIP_INIT`, `REQ_SKIP_TLS_VERIFY`                                                   | shared HTTP budget (also for `*.url` downloads)                                   |
+| `ENABLE_5XX`, `UNIQUE_FILENAMES`, `DEFAULT_FILE_MODE`                                                                  |                                                                                   |
+| `SKIP_TLS_VERIFY`, `KUBECONFIG`                                                                                        | Kubernetes client                                                                 |
+| `WATCH_SERVER_TIMEOUT`, `WATCH_CLIENT_TIMEOUT`                                                                         | server `timeoutSeconds` / client read timeout                                     |
+| `IGNORE_ALREADY_PROCESSED`                                                                                             | dedupe on resourceVersion                                                         |
+| `HEALTH_PORT`                                                                                                          | `/healthz` (default 8080)                                                         |
+| `K8S_CONTACT_THRESHOLD_SECONDS`                                                                                        | liveness staleness override; default 2× per-stream heartbeat                      |
+| `LOG_LEVEL`, `LOG_FORMAT`, `LOG_TZ`                                                                                    | `JSON`/`LOGFMT`                                                                   |
 
 ## Deliberate differences from upstream
 
@@ -51,14 +52,21 @@ Port in progress — not yet released or deployed.
   image anyway).
 - **`DISABLE_X509_STRICT_VERIFICATION` is unsupported** — rustls has no
   non-strict mode.
-- **Liveness tracks per-stream API contact** — upstream's supervisor loop
-  unconditionally refreshes the shared contact timestamp every 5s, so the
-  check is ineffective at 2.5.0 (fixed upstream in 2.11.2; we use the fixed
-  semantics).
+- **Liveness tracks per-stream API contact** — matches upstream 2.11.2's fix:
+  each stream stamps contact on events and on watch-stream return; staleness
+  threshold is 2× that stream's heartbeat interval (`SLEEP_TIME` for pollers,
+  `WATCH_SERVER_TIMEOUT` for watchers) or `K8S_CONTACT_THRESHOLD_SECONDS` when
+  set. (Upstream derives one threshold from `mode` for all streams — ours is
+  per-stream, which handles mixed watch/sleep topologies exactly.)
+- **A dead worker task is fatal** — like upstream's supervisor exit, the
+  process exits nonzero so the container runtime restarts it. In-place stream
+  restarts still happen on retryable watch errors.
+- **A failed file write skips that file, not the batch** — matching upstream's
+  per-key error isolation, while still preserving the previous content.
 
 ## Layout
 
-```
+```shell
 src/main.rs    startup, signal handling, task supervision
 src/config.rs  env + CLI parsing and validation
 src/watch.rs   kube-rs watchers/listers -> bounded queue -> reconcile loop
@@ -69,7 +77,7 @@ src/health.rs  /healthz readiness + liveness
 
 ## Build
 
-```
+```shell
 cargo build --release
 docker buildx build --platform linux/amd64,linux/arm64 .
 ```

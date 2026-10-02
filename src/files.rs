@@ -81,15 +81,22 @@ pub fn resolve_dest_folder(
     folder_per_namespace: bool,
     namespace: &str,
 ) -> Result<PathBuf, io::Error> {
-    let mut dest = match annotations.and_then(|a| a.get(folder_annotation)) {
+    let dest = match annotations.and_then(|a| a.get(folder_annotation)) {
         Some(v) => {
             let p = Path::new(v);
             if p.is_absolute() {
+                // Upstream: absolute annotation is used verbatim — the
+                // namespace is NOT appended even with FOLDER_PER_NAMESPACE.
                 p.to_path_buf()
             } else {
-                let joined = default_folder.join(p);
-                let normalised = normalize(&joined);
-                if !normalised.starts_with(normalize(default_folder)) {
+                // Upstream: FOLDER/<ns>/<annotation> with FOLDER_PER_NAMESPACE.
+                let base = if folder_per_namespace {
+                    default_folder.join(namespace)
+                } else {
+                    default_folder.to_path_buf()
+                };
+                let normalised = normalize(&base.join(p));
+                if !normalised.starts_with(normalize(&base)) {
                     warn!(
                         annotation = folder_annotation,
                         value = v,
@@ -103,11 +110,9 @@ pub fn resolve_dest_folder(
                 normalised
             }
         }
+        None if folder_per_namespace => default_folder.join(namespace),
         None => default_folder.to_path_buf(),
     };
-    if folder_per_namespace {
-        dest = dest.join(namespace);
-    }
     Ok(dest)
 }
 
@@ -267,6 +272,7 @@ impl Reconciler {
     ) -> io::Result<bool> {
         let mut changed = false;
         let mut new_paths = BTreeSet::new();
+        let mut written = BTreeSet::new();
 
         for file in planned {
             new_paths.insert(file.path.clone());
@@ -282,7 +288,18 @@ impl Reconciler {
                     }
                 },
             };
-            changed |= write_if_changed(&file.path, &bytes, self.default_file_mode)?;
+            match write_if_changed(&file.path, &bytes, self.default_file_mode) {
+                Ok(c) => {
+                    changed |= c;
+                    written.insert(file.path.clone());
+                }
+                Err(e) => {
+                    // Per-file resilience (upstream catches per-key): a disk
+                    // error skips this file but doesn't abort the resource or
+                    // stop other files from being written.
+                    error!(path = %file.path.display(), error = %e, "write failed; keeping previous file");
+                }
+            }
         }
 
         let old = self
@@ -305,8 +322,12 @@ impl Reconciler {
             }
         }
 
+        // Claim ownership only for files we actually wrote (or already owned):
+        // a failed write must never mark a foreign file as ours.
         for p in &new_paths {
-            self.manifest.files.insert(p.clone(), owner.clone());
+            if written.contains(p) || self.manifest.files.get(p) == Some(owner) {
+                self.manifest.files.insert(p.clone(), owner.clone());
+            }
         }
         self.persist_manifest()?;
         Ok(changed)
@@ -537,6 +558,61 @@ mod tests {
     fn folder_per_namespace_appends_namespace() {
         let dest = resolve_dest_folder(None, Path::new("/folder"), "x", true, "prod").unwrap();
         assert_eq!(dest, PathBuf::from("/folder/prod"));
+    }
+
+    #[test]
+    fn folder_per_namespace_relative_annotation() {
+        // Upstream 2.11.2: FOLDER/<ns>/<annotation> for relative paths.
+        let ann = BTreeMap::from([(
+            "k8s-sidecar-target-directory".to_string(),
+            "sub".to_string(),
+        )]);
+        let dest = resolve_dest_folder(
+            Some(&ann),
+            Path::new("/folder"),
+            "k8s-sidecar-target-directory",
+            true,
+            "prod",
+        )
+        .unwrap();
+        assert_eq!(dest, PathBuf::from("/folder/prod/sub"));
+    }
+
+    #[test]
+    fn folder_per_namespace_absolute_annotation_unaffected() {
+        // Upstream 2.11.2: absolute annotation is verbatim — no namespace.
+        let ann = BTreeMap::from([(
+            "k8s-sidecar-target-directory".to_string(),
+            "/elsewhere".to_string(),
+        )]);
+        let dest = resolve_dest_folder(
+            Some(&ann),
+            Path::new("/folder"),
+            "k8s-sidecar-target-directory",
+            true,
+            "prod",
+        )
+        .unwrap();
+        assert_eq!(dest, PathBuf::from("/elsewhere"));
+    }
+
+    #[test]
+    fn folder_per_namespace_escape_via_annotation_rejected() {
+        // ../.. with per-namespace would escape FOLDER entirely.
+        let ann = BTreeMap::from([(
+            "k8s-sidecar-target-directory".to_string(),
+            "../../escape".to_string(),
+        )]);
+        assert!(
+            resolve_dest_folder(
+                Some(&ann),
+                Path::new("/folder"),
+                "k8s-sidecar-target-directory",
+                true,
+                "ns",
+            )
+            .is_err()
+        );
     }
 
     #[test]

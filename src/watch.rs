@@ -8,6 +8,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
+use std::time::Duration;
 
 use futures_util::StreamExt;
 use k8s_openapi::api::core::v1::{ConfigMap, Secret};
@@ -134,9 +135,16 @@ pub async fn run_watcher(ctx: StreamCtx, kind: Kind, namespace: String) {
         if ctx.cancel.is_cancelled() {
             return;
         }
+        if result.is_ok() {
+            // Clean end (server closed the watch on timeout): upstream stamps
+            // the heartbeat here — reaching it proves the stream ran its full
+            // course rather than stalling silently.
+            ctx.health.contact(&id);
+        }
         ctx.health.stream_dead(&id);
         error!(stream = %id, error = ?result, "watch stream ended; restarting");
-        ctx.health.register_stream(&id);
+        ctx.health
+            .register_stream(&id, Duration::from_secs(ctx.cfg.watch_server_timeout));
         tokio::select! {
             _ = ctx.cancel.cancelled() => return,
             _ = tokio::time::sleep(ctx.cfg.error_throttle_sleep) => {}
@@ -526,9 +534,9 @@ mod tests {
     ) -> (Harness, tokio::task::JoinHandle<()>) {
         let (tx, rx) = mpsc::channel(64);
         let rec = Reconciler::load(folder, cfg.default_file_mode, cfg.ignore_already_processed);
-        let health = HealthState::new();
+        let health = HealthState::new(None);
         for s in streams {
-            health.register_stream(s);
+            health.register_stream(s, Duration::from_secs(60));
         }
         let cancel = CancellationToken::new();
         let ctx = ReconcileCtx {

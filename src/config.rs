@@ -156,6 +156,9 @@ pub struct Config {
     pub watch_server_timeout: u64,
     pub watch_client_timeout: u64,
     pub ignore_already_processed: bool,
+    /// `K8S_CONTACT_THRESHOLD_SECONDS` — liveness staleness override; when
+    /// unset each stream uses 2× its heartbeat interval (upstream 2.11.2).
+    pub k8s_contact_threshold: Option<Duration>,
     pub health_port: u16,
     pub log_level: String,
     pub log_format: LogFormat,
@@ -486,6 +489,17 @@ pub fn load(env: &HashMap<String, String>, args: &[String]) -> Result<Config, Co
         watch_server_timeout: parse_u64(env, "WATCH_SERVER_TIMEOUT", 60)?,
         watch_client_timeout: parse_u64(env, "WATCH_CLIENT_TIMEOUT", 66)?,
         ignore_already_processed: parse_bool(env.get("IGNORE_ALREADY_PROCESSED")),
+        k8s_contact_threshold: env
+            .get("K8S_CONTACT_THRESHOLD_SECONDS")
+            .map(|v| {
+                v.parse::<u64>()
+                    .map(Duration::from_secs)
+                    .map_err(|_| ConfigError::Invalid {
+                        var: "K8S_CONTACT_THRESHOLD_SECONDS",
+                        value: v.clone(),
+                    })
+            })
+            .transpose()?,
         health_port: parse_u64(env, "HEALTH_PORT", 8080)? as u16,
         log_level: env
             .get("LOG_LEVEL")

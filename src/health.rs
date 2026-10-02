@@ -15,25 +15,28 @@ use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
 
-pub const K8S_CONTACT_THRESHOLD: Duration = Duration::from_secs(60);
-
 #[derive(Default)]
 struct Inner {
-    /// stream id -> last successful API contact.
-    contact: HashMap<String, Instant>,
+    /// stream id -> (last successful API contact, staleness threshold).
+    /// Threshold is 2× the stream's heartbeat interval (SLEEP_TIME for pollers,
+    /// WATCH_SERVER_TIMEOUT for watchers) — upstream 2.11.2 semantics.
+    contact: HashMap<String, (Instant, Duration)>,
     /// stream id -> alive.
     alive: HashMap<String, bool>,
 }
 
 pub struct HealthState {
     ready: AtomicBool,
+    override_threshold: Option<Duration>,
     inner: Mutex<Inner>,
 }
 
 impl HealthState {
-    pub fn new() -> Arc<Self> {
+    /// `threshold_override` mirrors `K8S_CONTACT_THRESHOLD_SECONDS`.
+    pub fn new(threshold_override: Option<Duration>) -> Arc<Self> {
         Arc::new(Self {
             ready: AtomicBool::new(false),
+            override_threshold: threshold_override,
             inner: Mutex::new(Inner::default()),
         })
     }
@@ -42,15 +45,20 @@ impl HealthState {
         self.ready.store(true, Ordering::SeqCst);
     }
 
-    pub fn register_stream(&self, stream: &str) {
+    /// Register a stream; `heartbeat` is how often a healthy stream reports in.
+    /// The staleness threshold is 2× that, matching upstream's derivation.
+    pub fn register_stream(&self, stream: &str, heartbeat: Duration) {
         let mut i = self.inner.lock().unwrap();
         i.alive.insert(stream.to_string(), true);
-        i.contact.insert(stream.to_string(), Instant::now());
+        i.contact
+            .insert(stream.to_string(), (Instant::now(), 2 * heartbeat));
     }
 
     pub fn contact(&self, stream: &str) {
-        if let Ok(mut i) = self.inner.lock() {
-            i.contact.insert(stream.to_string(), Instant::now());
+        if let Ok(mut i) = self.inner.lock()
+            && let Some(entry) = i.contact.get_mut(stream)
+        {
+            entry.0 = Instant::now();
         }
     }
 
@@ -70,11 +78,10 @@ impl HealthState {
             return (503, "NOT LIVE (watcher thread died)");
         }
         let now = Instant::now();
-        if inner
-            .contact
-            .values()
-            .any(|t| now.duration_since(*t) > K8S_CONTACT_THRESHOLD)
-        {
+        let stale = inner.contact.values().any(|(t, threshold)| {
+            now.duration_since(*t) > self.override_threshold.unwrap_or(*threshold)
+        });
+        if stale {
             return (503, "NOT LIVE (K8s contact lost)");
         }
         (200, "OK")
@@ -195,8 +202,8 @@ mod tests {
 
     #[tokio::test]
     async fn not_ready_until_marked() {
-        let state = HealthState::new();
-        state.register_stream("cm/ns");
+        let state = HealthState::new(None);
+        state.register_stream("cm/ns", Duration::from_secs(60));
         let (port, cancel) = start(state.clone()).await;
         let (status, _) = get(port).await;
         assert_eq!(status, 503);
@@ -209,8 +216,8 @@ mod tests {
 
     #[tokio::test]
     async fn dead_stream_fails_liveness() {
-        let state = HealthState::new();
-        state.register_stream("cm/ns");
+        let state = HealthState::new(None);
+        state.register_stream("cm/ns", Duration::from_secs(60));
         state.mark_ready();
         let (port, cancel) = start(state.clone()).await;
         assert_eq!(get(port).await.0, 200);
@@ -221,9 +228,40 @@ mod tests {
         cancel.cancel();
     }
 
+    #[test]
+    fn stale_contact_fails_liveness() {
+        let state = HealthState::new(None);
+        // Heartbeat 10ms → threshold 20ms.
+        state.register_stream("cm/ns", Duration::from_millis(10));
+        state.mark_ready();
+        std::thread::sleep(Duration::from_millis(40));
+        let (status, body) = state.probe();
+        assert_eq!(status, 503);
+        assert!(body.contains("contact"));
+    }
+
+    #[test]
+    fn threshold_env_override_wins() {
+        // 10ms heartbeat would normally go stale in 20ms; a 1h override keeps it live.
+        let state = HealthState::new(Some(Duration::from_secs(3600)));
+        state.register_stream("cm/ns", Duration::from_millis(10));
+        state.mark_ready();
+        std::thread::sleep(Duration::from_millis(40));
+        assert_eq!(state.probe().0, 200);
+    }
+
+    #[test]
+    fn fresh_contact_within_threshold_stays_live() {
+        let state = HealthState::new(None);
+        state.register_stream("cm/ns", Duration::from_secs(60));
+        state.mark_ready();
+        state.contact("cm/ns");
+        assert_eq!(state.probe().0, 200);
+    }
+
     #[tokio::test]
     async fn unknown_path_404() {
-        let state = HealthState::new();
+        let state = HealthState::new(None);
         state.mark_ready();
         let (port, cancel) = start(state).await;
         let resp = reqwest::get(format!("http://127.0.0.1:{port}/nope"))

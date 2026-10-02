@@ -75,7 +75,7 @@ async fn run() -> i32 {
         }
     };
 
-    let health = HealthState::new();
+    let health = HealthState::new(cfg.k8s_contact_threshold);
     let cancel = CancellationToken::new();
 
     let (tx, rx) = mpsc::channel::<SyncEvent>(EVENT_QUEUE);
@@ -83,22 +83,24 @@ async fn run() -> i32 {
 
     // Expected stream ids: one per (resource kind, namespace); ALL collapses
     // to a single cluster-wide stream per kind, like upstream.
-    let mut expected = HashSet::new();
+    let mut expected: HashSet<(String, Duration)> = HashSet::new();
     for kind in &cfg.resources {
         match &namespaces {
             Namespaces::All => {
-                expected.insert(stream_id(*kind, "ALL"));
+                expected.insert((stream_id(*kind, "ALL"), heartbeat_for(&cfg, "ALL")));
             }
             Namespaces::List(list) => {
                 for ns in list {
-                    expected.insert(stream_id(*kind, ns));
+                    expected.insert((stream_id(*kind, ns), heartbeat_for(&cfg, ns)));
                 }
             }
             Namespaces::PodNamespace => unreachable!("resolved above"),
         }
     }
-    for s in &expected {
-        health.register_stream(s);
+    // Upstream 2.11.2: each stream's heartbeat interval is SLEEP_TIME for
+    // polling streams, WATCH_SERVER_TIMEOUT for watchers; staleness = 2× that.
+    for (s, heartbeat) in &expected {
+        health.register_stream(s, *heartbeat);
     }
 
     let fetcher = HttpFetcher {
@@ -145,7 +147,7 @@ async fn run() -> i32 {
             fetcher,
             reloader: reloader.clone(),
             health: health.clone(),
-            expected_streams: expected,
+            expected_streams: expected.iter().map(|(s, _)| s.clone()).collect(),
             cancel: cancel.clone(),
         };
         tasks.spawn(async move { reconcile_loop(rx, rec, ctx).await });
@@ -165,8 +167,23 @@ async fn run() -> i32 {
         return 0;
     }
 
-    wait_for_shutdown().await;
-    info!("shutdown signal received, stopping");
+    // Upstream 2.11.2 semantics: any worker dying is fatal — the process exits
+    // nonzero so the container runtime restarts it. No task should complete
+    // before cancellation.
+    tokio::select! {
+        _ = wait_for_shutdown() => {
+            info!("shutdown signal received, stopping");
+        }
+        res = tasks.join_next() => {
+            error!(result = ?res, "worker task exited unexpectedly; stopping");
+            cancel.cancel();
+            let _ = tokio::time::timeout(SHUTDOWN_GRACE, async {
+                while tasks.join_next().await.is_some() {}
+            })
+            .await;
+            return 1;
+        }
+    }
     cancel.cancel();
 
     let drain = tokio::time::timeout(SHUTDOWN_GRACE, async {
@@ -194,6 +211,16 @@ async fn wait_for_shutdown() {
     #[cfg(not(unix))]
     {
         let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
+/// Upstream 2.11.2 `heartbeat_interval`: polling streams report in every
+/// SLEEP_TIME; watch streams get a heartbeat whenever the server closes the
+/// watch (WATCH_SERVER_TIMEOUT) or an event arrives.
+fn heartbeat_for(cfg: &Config, ns: &str) -> Duration {
+    match cfg.effective_method(ns) {
+        Method::Sleep | Method::List => cfg.sleep_time,
+        Method::Watch => Duration::from_secs(cfg.watch_server_timeout),
     }
 }
 
