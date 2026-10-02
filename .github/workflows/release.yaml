@@ -25,6 +25,10 @@ on:
       minor:
         required: true
         type: string
+      sha:
+        required: false
+        type: string
+        description: Source SHA the tag points to (defaults to github.sha)
   workflow_dispatch:
     inputs:
       tag:
@@ -41,6 +45,10 @@ on:
       minor:
         required: true
         type: string
+      sha:
+        required: false
+        type: string
+        description: Source SHA the tag points to (defaults to github.sha)
 
 permissions:
   contents: read
@@ -68,6 +76,7 @@ jobs:
       - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.tag }}
+          persist-credentials: false
 
       - uses: docker/setup-buildx-action@v4
 
@@ -85,6 +94,15 @@ jobs:
           platforms: ${{ matrix.platform }}
           push: true
           tags: ${{ env.IMAGE }}:${{ inputs.version }}-${{ matrix.arch }}
+          labels: |
+            org.opencontainers.image.source=${{ github.event.repository.html_url }}
+            org.opencontainers.image.revision=${{ inputs.sha || github.sha }}
+            org.opencontainers.image.version=${{ inputs.version }}
+            org.opencontainers.image.licenses=MIT
+          annotations: |
+            org.opencontainers.image.source=${{ github.event.repository.html_url }}
+            org.opencontainers.image.revision=${{ inputs.sha || github.sha }}
+            org.opencontainers.image.version=${{ inputs.version }}
           sbom: true
           provenance: mode=max
           cache-from: type=gha,scope=${{ matrix.arch }}
@@ -107,12 +125,15 @@ jobs:
         env:
           VERSION: ${{ inputs.version }}
         run: |
-          for tag in "${{ inputs.version }}" "${{ inputs.major }}.${{ inputs.minor }}" "${{ inputs.major }}" "sha-${{ github.sha }}"; do
-            docker buildx imagetools create -t "${{ env.IMAGE }}:${tag}" \
-              "${{ env.IMAGE }}:${{ inputs.version }}-amd64" \
-              "${{ env.IMAGE }}:${{ inputs.version }}-arm64"
-          done
-          digest=$(docker buildx imagetools inspect "${{ env.IMAGE }}:${{ inputs.version }}" --format '{{.Manifest.Digest}}')
+          docker buildx imagetools create \
+            --annotation "index:org.opencontainers.image.source=${{ github.event.repository.html_url }}" \
+            -t "${{ env.IMAGE }}:$VERSION" \
+            -t "${{ env.IMAGE }}:${{ inputs.major }}.${{ inputs.minor }}" \
+            -t "${{ env.IMAGE }}:${{ inputs.major }}" \
+            -t "${{ env.IMAGE }}:sha-${{ inputs.sha || github.sha }}" \
+            "${{ env.IMAGE }}:$VERSION-amd64" \
+            "${{ env.IMAGE }}:$VERSION-arm64"
+          digest=$(docker buildx imagetools inspect "${{ env.IMAGE }}:$VERSION" --format '{{.Manifest.Digest}}')
           echo "digest=$digest" >> "$GITHUB_OUTPUT"
           echo "IMAGE_DIGEST=$digest" >> "$GITHUB_STEP_SUMMARY"
 
