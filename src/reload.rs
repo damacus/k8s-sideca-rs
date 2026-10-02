@@ -113,7 +113,7 @@ impl Reloader {
                 match &self.cfg.payload {
                     Some(Payload::Json(v)) => b.json(v),
                     Some(Payload::Text(t)) => b
-                        .header(reqwest::header::CONTENT_TYPE, "application/json")
+                        .header(reqwest::header::CONTENT_TYPE, "text/plain; charset=utf-8")
                         .body(t.clone()),
                     None => b,
                 }
@@ -225,6 +225,51 @@ mod tests {
         reqwest::Client::builder().build().unwrap()
     }
 
+    /// Accept one connection, reply `status`, and hand back the raw request.
+    fn capture_once(status: u16) -> (String, std::sync::mpsc::Receiver<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let Ok((mut s, _)) = listener.accept() else {
+                return;
+            };
+            let _ = s.set_read_timeout(Some(Duration::from_secs(5)));
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 4096];
+            loop {
+                match s.read(&mut chunk) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        buf.extend_from_slice(&chunk[..n]);
+                        if request_complete(&buf) {
+                            break;
+                        }
+                    }
+                }
+            }
+            let _ =
+                s.write_all(format!("HTTP/1.1 {status} X\r\nContent-Length: 0\r\n\r\n").as_bytes());
+            let _ = tx.send(String::from_utf8_lossy(&buf).into_owned());
+        });
+        (format!("http://{addr}/reload"), rx)
+    }
+
+    /// Headers done + `Content-Length` body bytes all present.
+    fn request_complete(buf: &[u8]) -> bool {
+        let Some(head_end) = buf.windows(4).position(|w| w == b"\r\n\r\n").map(|p| p + 4) else {
+            return false;
+        };
+        let head = String::from_utf8_lossy(&buf[..head_end]);
+        let len = head
+            .lines()
+            .filter_map(|l| l.split_once(':'))
+            .find(|(k, _)| k.trim().eq_ignore_ascii_case("content-length"))
+            .and_then(|(_, v)| v.trim().parse::<usize>().ok())
+            .unwrap_or(0);
+        buf.len() >= head_end + len
+    }
+
     #[test]
     fn basic_auth_latin1_encoding() {
         // "u:p" → dTpw; non-ASCII char maps to its latin1 byte.
@@ -279,6 +324,45 @@ mod tests {
         assert!(hits.load(Ordering::SeqCst) >= 3);
         cancel.cancel();
         let _ = task.await;
+    }
+
+    #[tokio::test]
+    async fn text_payload_is_sent_verbatim_without_json_content_type() {
+        // A non-JSON REQ_PAYLOAD must not be sent as application/json —
+        // receivers that inspect Content-Type (or validate the body) would
+        // otherwise try to parse raw text as JSON.
+        let (url, rx) = capture_once(200);
+        let mut c = cfg(url);
+        c.method = ReqMethod::Post;
+        c.payload = Some(Payload::Text("not json {".into()));
+        let r = Reloader::new(c, client());
+        r.attempt().await.unwrap();
+
+        let req = rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let head = req.split("\r\n\r\n").next().unwrap().to_lowercase();
+        let body = req.split("\r\n\r\n").nth(1).unwrap();
+        assert_eq!(body, "not json {");
+        assert!(
+            head.contains("content-type: text/plain"),
+            "expected text/plain content type, got:\n{head}"
+        );
+        assert!(!head.contains("application/json"));
+    }
+
+    #[tokio::test]
+    async fn json_payload_keeps_json_content_type() {
+        let (url, rx) = capture_once(200);
+        let mut c = cfg(url);
+        c.method = ReqMethod::Post;
+        c.payload = Some(Payload::Json(serde_json::json!({"a": 1})));
+        let r = Reloader::new(c, client());
+        r.attempt().await.unwrap();
+
+        let req = rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let head = req.split("\r\n\r\n").next().unwrap().to_lowercase();
+        let body = req.split("\r\n\r\n").nth(1).unwrap();
+        assert_eq!(body, "{\"a\":1}");
+        assert!(head.contains("content-type: application/json"));
     }
 
     #[tokio::test]
