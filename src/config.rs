@@ -228,6 +228,39 @@ fn parse_f64(
     }
 }
 
+/// A positive, finite f64 — negative/NaN/inf values would panic inside
+/// `Duration::from_secs_f64` or produce nonsensical backoff math.
+fn parse_f64_positive(
+    env: &HashMap<String, String>,
+    var: &'static str,
+    default: f64,
+) -> Result<f64, ConfigError> {
+    let v = parse_f64(env, var, default)?;
+    if !v.is_finite() || v <= 0.0 {
+        return Err(ConfigError::Invalid {
+            var,
+            value: env.get(var).cloned().unwrap_or_default(),
+        });
+    }
+    Ok(v)
+}
+
+/// A finite, non-negative f64 (backoff factor — 0 disables the delay).
+fn parse_f64_nonnegative(
+    env: &HashMap<String, String>,
+    var: &'static str,
+    default: f64,
+) -> Result<f64, ConfigError> {
+    let v = parse_f64(env, var, default)?;
+    if !v.is_finite() || v < 0.0 {
+        return Err(ConfigError::Invalid {
+            var,
+            value: env.get(var).cloned().unwrap_or_default(),
+        });
+    }
+    Ok(v)
+}
+
 /// Watch timeouts feed a `u32` apiserver parameter and the liveness
 /// heartbeat. `0` is not "no timeout": the server closes the watch
 /// immediately (hot reconnect loop) and a zero client read-timeout fails
@@ -455,9 +488,9 @@ pub fn load(env: &HashMap<String, String>, args: &[String]) -> Result<Config, Co
             total: parse_u32(env, "REQ_RETRY_TOTAL", 5)?,
             connect: parse_u32(env, "REQ_RETRY_CONNECT", 10)?,
             read: parse_u32(env, "REQ_RETRY_READ", 5)?,
-            backoff_factor: parse_f64(env, "REQ_RETRY_BACKOFF_FACTOR", 1.1)?,
+            backoff_factor: parse_f64_nonnegative(env, "REQ_RETRY_BACKOFF_FACTOR", 1.1)?,
         },
-        timeout: Duration::from_secs_f64(parse_f64(env, "REQ_TIMEOUT", 10.0)?),
+        timeout: Duration::from_secs_f64(parse_f64_positive(env, "REQ_TIMEOUT", 10.0)?),
     };
 
     let req = match env.get("REQ_URL").filter(|v| !v.is_empty()) {
@@ -898,6 +931,32 @@ mod tests {
         }
         let e = env(&[("LABEL", "x"), ("FOLDER", "/tmp"), ("HEALTH_PORT", "9090")]);
         assert_eq!(load(&e, &[]).unwrap().health_port, 9090);
+    }
+
+    #[test]
+    fn nonpositive_or_nonfinite_timeouts_rejected() {
+        // These used to panic inside Duration::from_secs_f64.
+        for bad in ["-1", "0", "inf", "-inf", "NaN"] {
+            let e = env(&[("LABEL", "x"), ("FOLDER", "/tmp"), ("REQ_TIMEOUT", bad)]);
+            assert!(load(&e, &[]).is_err(), "REQ_TIMEOUT={bad} must be rejected");
+        }
+    }
+
+    #[test]
+    fn negative_backoff_factor_rejected() {
+        let e = env(&[
+            ("LABEL", "x"),
+            ("FOLDER", "/tmp"),
+            ("REQ_RETRY_BACKOFF_FACTOR", "-1.5"),
+        ]);
+        assert!(load(&e, &[]).is_err());
+        // 0 is legitimate: retry immediately.
+        let e = env(&[
+            ("LABEL", "x"),
+            ("FOLDER", "/tmp"),
+            ("REQ_RETRY_BACKOFF_FACTOR", "0"),
+        ]);
+        assert!(load(&e, &[]).is_ok());
     }
 
     #[test]
