@@ -6,7 +6,7 @@
 //! contact check ineffective; we track contact per stream instead).
 
 use std::collections::HashMap;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -134,14 +134,15 @@ fn bind(port: u16) -> Option<TcpListener> {
         .ok()
 }
 
+/// Cap on bytes read from a probe connection — a client sending a huge
+/// header line must not make the handler buffer unboundedly.
+const MAX_REQUEST_BYTES: u64 = 8 * 1024;
+
 fn handle(stream: std::net::TcpStream, state: Arc<HealthState>) {
     let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
-    let mut reader = BufReader::new(match stream.try_clone() {
-        Ok(s) => s,
-        Err(_) => return,
-    });
+    let mut reader = BufReader::new((&stream).take(MAX_REQUEST_BYTES));
     let mut request_line = String::new();
-    if reader.read_line(&mut request_line).is_err() {
+    if reader.read_line(&mut request_line).is_err() || request_line.is_empty() {
         return;
     }
     let mut parts = request_line.split_whitespace();
@@ -268,6 +269,36 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status().as_u16(), 404);
+        cancel.cancel();
+    }
+
+    #[tokio::test]
+    async fn oversized_request_line_is_bounded() {
+        // A client sending a huge header line without a newline must not make
+        // the handler buffer unboundedly — it answers and closes.
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let state = HealthState::new(None);
+        state.mark_ready();
+        let (port, cancel) = start(state).await;
+
+        let mut sock = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .unwrap();
+        sock.write_all(&vec![b'A'; 128 * 1024]).await.unwrap();
+        sock.write_all(b"\r\n\r\n").await.unwrap();
+
+        let mut resp = Vec::new();
+        let outcome = tokio::time::timeout(Duration::from_secs(5), sock.read_to_end(&mut resp))
+            .await
+            .expect("handler should close the connection promptly");
+        match outcome {
+            Ok(_) => assert!(resp.starts_with(b"HTTP/1.1")),
+            Err(e) => assert_eq!(
+                e.kind(),
+                std::io::ErrorKind::ConnectionReset,
+                "over-limit request should be answered or reset, not {e:?}"
+            ),
+        }
         cancel.cancel();
     }
 }
