@@ -273,6 +273,7 @@ impl Reconciler {
         let mut changed = false;
         let mut new_paths = BTreeSet::new();
         let mut written = BTreeSet::new();
+        let mut any_failed = false;
 
         for file in planned {
             new_paths.insert(file.path.clone());
@@ -284,6 +285,7 @@ impl Reconciler {
                         // Deliberate difference: upstream writes the empty
                         // response body; we keep the previous file content.
                         error!(url = %url, error = %e, "url fetch failed; keeping previous file");
+                        any_failed = true;
                         continue;
                     }
                 },
@@ -298,6 +300,7 @@ impl Reconciler {
                     // error skips this file but doesn't abort the resource or
                     // stop other files from being written.
                     error!(path = %file.path.display(), error = %e, "write failed; keeping previous file");
+                    any_failed = true;
                 }
             }
         }
@@ -308,7 +311,10 @@ impl Reconciler {
                 owner.key(),
                 ResourceState {
                     paths: new_paths.clone(),
-                    resource_version,
+                    // A partially-failed apply must not consume the rv —
+                    // IGNORE_ALREADY_PROCESSED would otherwise suppress the
+                    // retry of the identical resource_version forever.
+                    resource_version: if any_failed { None } else { resource_version },
                 },
             )
             .map(|s| s.paths)
@@ -813,6 +819,31 @@ mod tests {
             .unwrap();
         assert!(rec.already_processed(&owner(), Some("5")));
         assert!(!rec.already_processed(&owner(), Some("6")));
+    }
+
+    #[tokio::test]
+    async fn failed_apply_does_not_mark_resource_version() {
+        // IGNORE_ALREADY_PROCESSED must not record a resource_version that
+        // only partially applied — otherwise the retry of the same rv is
+        // suppressed forever (the failed file never gets written).
+        let tmp = TempDir::new().unwrap();
+        let folder = tmp.path().to_path_buf();
+        let mut rec = Reconciler::load(&folder, None, true);
+        let planned = plan_files(
+            &folder,
+            &owner(),
+            &texts(&[("ok", "1"), ("dl.url", "http://unreachable/x")]),
+            &BTreeMap::new(),
+            false,
+        );
+        // NoFetch fails the .url fetch — partial apply.
+        rec.apply(&owner(), planned, Some("7".into()), &NoFetch)
+            .await
+            .unwrap();
+        assert!(
+            !rec.already_processed(&owner(), Some("7")),
+            "failed apply must not consume the resource_version"
+        );
     }
 
     #[tokio::test]
