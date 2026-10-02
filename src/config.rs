@@ -98,10 +98,18 @@ pub struct RetryConfig {
 }
 
 impl RetryConfig {
-    /// urllib3-style exponential backoff for retry `attempt` (1-based).
+    /// urllib3-style exponential backoff for retry `attempt` (1-based),
+    /// capped at urllib3's `Retry.BACKOFF_MAX` (120s). The cap also bounds
+    /// the delay when the exponent overflows f64 (huge REQ_RETRY_TOTAL) —
+    /// uncapped, `from_secs_f64(inf)` panics.
+    // f64::max/min pass the non-NaN operand through — a hand-built
+    // RetryConfig can carry a NaN factor (pub fields), and f64::clamp
+    // would propagate NaN into from_secs_f64 where it panics.
+    #[allow(clippy::manual_clamp)]
     pub fn backoff_delay(&self, attempt: u32) -> Duration {
+        const BACKOFF_MAX_SECS: f64 = 120.0;
         let secs = self.backoff_factor * 2f64.powi(attempt.saturating_sub(1) as i32);
-        Duration::from_secs_f64(secs.max(0.0))
+        Duration::from_secs_f64(secs.max(0.0).min(BACKOFF_MAX_SECS))
     }
 }
 
@@ -972,6 +980,20 @@ mod tests {
         assert_eq!(retries.backoff_delay(3), Duration::from_secs_f64(2.0));
         // attempt 0 is not a real call site but must not panic or go negative.
         assert_eq!(retries.backoff_delay(0), Duration::from_secs_f64(0.5));
+    }
+
+    #[test]
+    fn backoff_delay_caps_at_urllib3_max() {
+        // urllib3 Retry.BACKOFF_MAX = 120s. Also guards the f64 overflow
+        // path: 2^2000 saturates to inf, which used to panic in
+        // Duration::from_secs_f64.
+        let retries = RetryConfig {
+            total: 3000,
+            connect: 3,
+            read: 3,
+            backoff_factor: 1.1,
+        };
+        assert_eq!(retries.backoff_delay(2000), Duration::from_secs(120));
     }
 
     #[test]
