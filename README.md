@@ -42,8 +42,17 @@ Port in progress — not yet released or deployed.
 - **Ownership manifest** — `.k8s-sidecar-rs.manifest.json` tracks which files
   this sidecar owns, so a restart cleans owned stale files without touching
   unrelated files. Upstream leaves stale files across restarts.
+  The manifest lives inside `FOLDER` — the only guaranteed-writable path.
+  Consumers scanning `FOLDER` must tolerate a dot-prefixed JSON file (Grafana's
+  file provisioner skips dotfiles; Loki's `*.yaml` glob is unaffected).
 - **Path traversal** — a relative `FOLDER_ANNOTATION` that escapes `FOLDER` is
-  rejected; upstream allows it.
+  rejected; upstream allows it. An **absolute** annotation path is still used
+  verbatim (upstream parity): anyone able to create a matching resource in a
+  watched namespace can redirect writes anywhere the pod user can write.
+  Treat RBAC on labeled ConfigMaps/Secrets as the control.
+- **Failed apply preserves files** — if destination resolution or a write
+  fails for a resource that was previously applied, its existing files are
+  kept rather than deleted at the end of the relist.
 - **Failed `.url` fetch keeps the previous file** — upstream writes an empty
   file.
 - **Failed reload callbacks stay pending** and are retried; upstream drops them
