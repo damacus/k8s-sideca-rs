@@ -45,6 +45,12 @@ async fn run() -> i32 {
     if cfg.resource_name_ignored() {
         warn!("RESOURCE_NAME has no effect with NAMESPACE=ALL; selectors are ignored");
     }
+    if let Some(tz) = env.get("LOG_TZ")
+        && !tz.eq_ignore_ascii_case("UTC")
+        && !tz.eq_ignore_ascii_case("LOCAL")
+    {
+        info!(value = %tz, "unrecognised LOG_TZ; using local time");
+    }
     rustls::crypto::ring::default_provider()
         .install_default()
         .ok();
@@ -316,15 +322,26 @@ impl UrlFetcher for HttpFetcher {
 }
 
 fn init_logging(cfg: &Config) {
+    use tracing_subscriber::fmt::time::LocalTime;
     let filter = EnvFilter::try_new(&cfg.log_level).unwrap_or_else(|_| EnvFilter::new("info"));
     match cfg.log_format {
-        LogFormat::Json => tracing_subscriber::fmt()
-            .json()
-            .with_env_filter(filter)
-            .init(),
-        LogFormat::Logfmt => tracing_subscriber::fmt()
-            .with_env_filter(filter)
-            .with_ansi(false)
-            .init(),
+        LogFormat::Json => {
+            let fmt = tracing_subscriber::fmt().json().with_env_filter(filter);
+            if cfg.log_tz_utc {
+                fmt.init();
+            } else {
+                fmt.with_timer(LocalTime::rfc_3339()).init();
+            }
+        }
+        LogFormat::Logfmt => {
+            let fmt = tracing_subscriber::fmt()
+                .with_env_filter(filter)
+                .with_ansi(false);
+            if cfg.log_tz_utc {
+                fmt.init();
+            } else {
+                fmt.with_timer(LocalTime::rfc_3339()).init();
+            }
+        }
     }
 }
