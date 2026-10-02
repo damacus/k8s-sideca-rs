@@ -11,7 +11,7 @@ use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
-use crate::config::{BasicAuthEncoding, Payload, ReqConfig, ReqMethod};
+use crate::config::{BasicAuthEncoding, FailureKind, Payload, ReqConfig, ReqMethod};
 
 pub struct Reloader {
     cfg: ReqConfig,
@@ -92,38 +92,46 @@ impl Reloader {
     }
 
     async fn attempt(&self) -> Result<(), String> {
-        let retries = &self.cfg.common.retries;
+        let mut tracker = self.cfg.common.retries.tracker();
         let mut delay = Duration::ZERO;
-        for attempt in 0..=retries.total {
-            if attempt > 0 {
+        loop {
+            if tracker.retries_taken() > 0 {
                 tokio::time::sleep(delay).await;
             }
             match self.send_once().await {
                 Ok(resp) => {
                     let status = resp.status();
                     if status.is_server_error() && !self.cfg.common.enable_5xx {
-                        if attempt < retries.total {
-                            delay = retries.backoff_delay(attempt);
-                            warn!(status = %status, "reload returned 5xx; retrying");
-                            continue;
+                        match tracker.failed(FailureKind::Status) {
+                            Some(d) => {
+                                delay = d;
+                                warn!(status = %status, "reload returned 5xx; retrying");
+                                continue;
+                            }
+                            None => return Err(format!("server returned {status}")),
                         }
-                        return Err(format!("server returned {status}"));
                     }
                     return Ok(());
                 }
                 Err(e) => {
-                    if attempt < retries.total {
-                        delay = retries.backoff_delay(attempt);
-                        continue;
+                    let kind = if e.is_connect() {
+                        FailureKind::Connect
+                    } else {
+                        FailureKind::Read
+                    };
+                    match tracker.failed(kind) {
+                        Some(d) => {
+                            delay = d;
+                            continue;
+                        }
+                        None => return Err(e.to_string()),
                     }
-                    return Err(e);
                 }
             }
         }
-        unreachable!()
     }
 
-    async fn send_once(&self) -> Result<reqwest::Response, String> {
+    async fn send_once(&self) -> Result<reqwest::Response, reqwest::Error> {
         let mut builder = match self.cfg.method {
             ReqMethod::Get => self.http.get(&self.cfg.url),
             ReqMethod::Post => {
@@ -140,11 +148,7 @@ impl Reloader {
         if let Some(header) = basic_auth_header(&self.cfg.common) {
             builder = builder.header(reqwest::header::AUTHORIZATION, header);
         }
-        builder
-            .timeout(self.cfg.common.timeout)
-            .send()
-            .await
-            .map_err(|e| e.to_string())
+        builder.timeout(self.cfg.common.timeout).send().await
     }
 }
 

@@ -111,6 +111,63 @@ impl RetryConfig {
         let secs = self.backoff_factor * 2f64.powi(attempt.saturating_sub(1) as i32);
         Duration::from_secs_f64(secs.max(0.0).min(BACKOFF_MAX_SECS))
     }
+
+    /// Per-request retry state — urllib3's connect/read budgets are separate
+    /// counters that each also consume `total`.
+    pub fn tracker(&self) -> RetryTracker<'_> {
+        RetryTracker {
+            cfg: self,
+            retries_taken: 0,
+            connect_used: 0,
+            read_used: 0,
+        }
+    }
+}
+
+/// Which budget a failure consumes (all failures also consume `total`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailureKind {
+    /// TCP/TLS connect failure (`REQ_RETRY_CONNECT`).
+    Connect,
+    /// Other send/receive failure — timeouts, resets (`REQ_RETRY_READ`).
+    Read,
+    /// Server 5xx with retries enabled (`total` only).
+    Status,
+}
+
+pub struct RetryTracker<'a> {
+    cfg: &'a RetryConfig,
+    retries_taken: u32,
+    connect_used: u32,
+    read_used: u32,
+}
+
+impl RetryTracker<'_> {
+    /// Retries granted so far (the current attempt number).
+    pub fn retries_taken(&self) -> u32 {
+        self.retries_taken
+    }
+
+    /// Record a failure; `Some(delay)` when another attempt is allowed.
+    pub fn failed(&mut self, kind: FailureKind) -> Option<Duration> {
+        let within_budget = match kind {
+            FailureKind::Connect => {
+                self.connect_used += 1;
+                self.connect_used <= self.cfg.connect
+            }
+            FailureKind::Read => {
+                self.read_used += 1;
+                self.read_used <= self.cfg.read
+            }
+            FailureKind::Status => true,
+        };
+        if !within_budget || self.retries_taken >= self.cfg.total {
+            return None;
+        }
+        let delay = self.cfg.backoff_delay(self.retries_taken);
+        self.retries_taken += 1;
+        Some(delay)
+    }
 }
 
 /// Shared HTTP settings for `REQ_URL` callbacks *and* `*.url` downloads —
@@ -1010,6 +1067,39 @@ mod tests {
             backoff_factor: 1.1,
         };
         assert_eq!(retries.backoff_delay(2000), Duration::from_secs(120));
+    }
+
+    #[test]
+    fn retry_tracker_honours_connect_and_total_budgets() {
+        // urllib3 semantics: a connect failure consumes its own budget AND
+        // total — a tight REQ_RETRY_CONNECT caps retries even when total
+        // remains.
+        let retries = RetryConfig {
+            total: 5,
+            connect: 1,
+            read: 5,
+            backoff_factor: 0.0,
+        };
+        let mut t = retries.tracker();
+        assert!(t.failed(FailureKind::Connect).is_some());
+        assert!(
+            t.failed(FailureKind::Connect).is_none(),
+            "connect budget exhausted must stop retries despite total"
+        );
+    }
+
+    #[test]
+    fn retry_tracker_read_and_status_share_total() {
+        let retries = RetryConfig {
+            total: 2,
+            connect: 10,
+            read: 5,
+            backoff_factor: 0.0,
+        };
+        let mut t = retries.tracker();
+        assert!(t.failed(FailureKind::Read).is_some());
+        assert!(t.failed(FailureKind::Status).is_some());
+        assert!(t.failed(FailureKind::Read).is_none(), "total exhausted");
     }
 
     #[test]
