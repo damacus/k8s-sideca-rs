@@ -49,6 +49,8 @@ struct Inner {
     page_size: Option<usize>,
     /// One-shot failure code for the next watch request.
     fail_watch: Option<u16>,
+    /// Persistent failure code for every API request (list + watch).
+    fail_all: Option<u16>,
 }
 
 #[derive(Clone)]
@@ -114,6 +116,11 @@ impl MockKube {
     /// The next watch request fails with this HTTP status (one shot).
     fn fail_next_watch(&self, code: u16) {
         self.state.lock().unwrap().fail_watch = Some(code);
+    }
+
+    /// Every subsequent API request (list + watch) fails with this status.
+    fn fail_everything(&self, code: u16) {
+        self.state.lock().unwrap().fail_all = Some(code);
     }
 
     fn set_page_size(&self, n: usize) {
@@ -228,6 +235,17 @@ async fn respond_list_or_watch(
     resource: String,
     q: Params,
 ) -> Response {
+    if let Some(code) = mock.lock().unwrap().fail_all {
+        return (
+            StatusCode::from_u16(code).unwrap(),
+            axum::Json(json!({
+                "kind": "Status", "apiVersion": "v1", "status": "Failure",
+                "reason": "InternalError", "code": code,
+                "message": "mock API failure",
+            })),
+        )
+            .into_response();
+    }
     if q.get("watch").is_some_and(|v| v == "true" || v == "1") {
         return watch_response(mock, ns, resource);
     }
@@ -336,6 +354,7 @@ impl UrlFetcher for NoFetch {
 struct Sidecar {
     dir: TempDir,
     cancel: CancellationToken,
+    health: Arc<HealthState>,
     _tasks: JoinSet<()>,
 }
 
@@ -405,7 +424,7 @@ async fn spawn_sidecar(mock: &MockKube, cfg: Arc<Config>, kind: Kind, ns: &str) 
         cfg,
         fetcher: NoFetch,
         reloader: None,
-        health,
+        health: health.clone(),
         expected_streams: HashSet::from([id]),
         cancel: cancel.clone(),
     };
@@ -413,6 +432,7 @@ async fn spawn_sidecar(mock: &MockKube, cfg: Arc<Config>, kind: Kind, ns: &str) 
     Sidecar {
         dir,
         cancel,
+        health,
         _tasks: tasks,
     }
 }
@@ -572,5 +592,38 @@ async fn lister_resource_name_get_and_404() {
     );
     let sc = spawn_sidecar(&mock, cfg, Kind::ConfigMap, "ns1").await;
     assert_eq!(wait_file(&sc.dir, "w.json").await, "named");
+    sc.cancel.cancel();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dead_stream_stays_dead_across_reconnects() {
+    // With the API hard-down, the watcher loops reconnect attempts. A restart
+    // must not revive liveness on its own — only real events may — or a dead
+    // stream would flap healthy on every retry.
+    let mock = MockKube::start().await;
+    mock.upsert_cm("ns1", "cm-a", &[("a.json", "v1")]);
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = cfg_for(dir.path(), &[]);
+    let sc = spawn_sidecar(&mock, cfg, Kind::ConfigMap, "ns1").await;
+    wait_file(&sc.dir, "a.json").await;
+    assert!(
+        wait_for(|| sc.health.probe().0 == 200).await,
+        "timed out waiting for ready+live"
+    );
+
+    mock.fail_everything(500);
+    mock.close_watches();
+
+    assert!(
+        wait_for(|| sc.health.probe().0 == 503).await,
+        "dead stream must drop liveness"
+    );
+    // Stay dead through several reconnect cycles (throttle is 1s in tests).
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert_eq!(
+        sc.health.probe().0,
+        503,
+        "reconnect attempts revived liveness without events"
+    );
     sc.cancel.cancel();
 }

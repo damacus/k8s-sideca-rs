@@ -68,8 +68,17 @@ impl HealthState {
         }
     }
 
+    /// Mark a stream alive — only a real event from the stream may do this.
+    /// Restarting the watch must NOT revive liveness (a stream that can
+    /// never establish would otherwise flap healthy on every retry).
+    pub fn stream_alive(&self, stream: &str) {
+        if let Ok(mut i) = self.inner.lock() {
+            i.alive.insert(stream.to_string(), true);
+        }
+    }
+
     /// (status_code, body)
-    fn probe(&self) -> (u16, &'static str) {
+    pub fn probe(&self) -> (u16, &'static str) {
         if !self.ready.load(Ordering::SeqCst) {
             return (503, "NOT READY");
         }
@@ -277,6 +286,19 @@ mod tests {
         state.register_stream("cm/ns", Duration::from_secs(60));
         state.mark_ready();
         state.contact("cm/ns");
+        assert_eq!(state.probe().0, 200);
+    }
+
+    #[test]
+    fn dead_stream_revives_only_via_events() {
+        // stream_dead persists: a watcher restart must not resurrect
+        // liveness — only stream_alive (a real event) may.
+        let state = HealthState::new(None);
+        state.register_stream("cm/ns", Duration::from_secs(60));
+        state.mark_ready();
+        state.stream_dead("cm/ns");
+        assert_eq!(state.probe().0, 503);
+        state.stream_alive("cm/ns");
         assert_eq!(state.probe().0, 200);
     }
 
