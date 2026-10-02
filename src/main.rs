@@ -266,10 +266,10 @@ struct HttpFetcher {
 
 impl UrlFetcher for HttpFetcher {
     async fn fetch(&self, url: &str, _binary: bool) -> Result<Vec<u8>, String> {
-        let retries = &self.settings.retries;
+        let mut tracker = self.settings.retries.tracker();
         let mut delay = Duration::ZERO;
-        for attempt in 0..=retries.total {
-            if attempt > 0 {
+        loop {
+            if tracker.retries_taken() > 0 {
                 tokio::time::sleep(delay).await;
             }
             let mut req = self.http.get(url).timeout(self.settings.timeout);
@@ -279,11 +279,13 @@ impl UrlFetcher for HttpFetcher {
             match req.send().await {
                 Ok(resp) => {
                     if resp.status().is_server_error() && !self.settings.enable_5xx {
-                        if attempt < retries.total {
-                            delay = retries.backoff_delay(attempt);
-                            continue;
+                        match tracker.failed(config::FailureKind::Status) {
+                            Some(d) => {
+                                delay = d;
+                                continue;
+                            }
+                            None => return Err(format!("{url} returned {}", resp.status())),
                         }
-                        return Err(format!("{url} returned {}", resp.status()));
                     }
                     return resp
                         .bytes()
@@ -292,15 +294,21 @@ impl UrlFetcher for HttpFetcher {
                         .map_err(|e| e.to_string());
                 }
                 Err(e) => {
-                    if attempt < retries.total {
-                        delay = retries.backoff_delay(attempt);
-                        continue;
+                    let kind = if e.is_connect() {
+                        config::FailureKind::Connect
+                    } else {
+                        config::FailureKind::Read
+                    };
+                    match tracker.failed(kind) {
+                        Some(d) => {
+                            delay = d;
+                            continue;
+                        }
+                        None => return Err(e.to_string()),
                     }
-                    return Err(e.to_string());
                 }
             }
         }
-        unreachable!()
     }
 }
 
