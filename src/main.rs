@@ -13,6 +13,7 @@ use tracing_subscriber::EnvFilter;
 use k8s_sidecar_rs::config::{self, Config, LogFormat, Method, Namespaces};
 use k8s_sidecar_rs::files::{Reconciler, UrlFetcher};
 use k8s_sidecar_rs::health::{self, HealthState};
+use k8s_sidecar_rs::http::build_req_client;
 use k8s_sidecar_rs::reload::{self, Reloader};
 use k8s_sidecar_rs::watch::{self, SyncEvent, reconcile_loop, run_lister, run_watcher, stream_id};
 
@@ -61,7 +62,7 @@ async fn run() -> i32 {
         }
     };
 
-    let http = match build_http_client(&cfg) {
+    let http = match build_req_client(&cfg) {
         Ok(c) => c,
         Err(e) => {
             error!(error = %e, "cannot build http client");
@@ -253,25 +254,6 @@ async fn build_client(cfg: &Config) -> Result<Client, String> {
     }
     kcfg.read_timeout = Some(Duration::from_secs(cfg.watch_client_timeout));
     Client::try_from(kcfg).map_err(|e| e.to_string())
-}
-
-/// reqwest client rooted on bundled webpki roots — the scratch image ships no
-/// CA bundle. `REQ_SKIP_TLS_VERIFY` disables verification for REQ_URL/*.url
-/// calls only (kube API TLS is governed by SKIP_TLS_VERIFY).
-fn build_http_client(cfg: &Config) -> Result<reqwest::Client, String> {
-    let provider = Arc::new(rustls::crypto::ring::default_provider());
-    let mut roots = rustls::RootCertStore::empty();
-    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-    let tls = rustls::ClientConfig::builder_with_provider(provider)
-        .with_safe_default_protocol_versions()
-        .map_err(|e| e.to_string())?
-        .with_root_certificates(roots)
-        .with_no_client_auth();
-    reqwest::Client::builder()
-        .use_preconfigured_tls(tls)
-        .danger_accept_invalid_certs(cfg.req_skip_tls_verify)
-        .build()
-        .map_err(|e| e.to_string())
 }
 
 /// `.url` key downloads — same shared HTTP session semantics as upstream:
