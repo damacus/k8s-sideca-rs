@@ -477,8 +477,11 @@ pub fn load(env: &HashMap<String, String>, args: &[String]) -> Result<Config, Co
         resources,
         resource_names,
         method,
-        sleep_time: Duration::from_secs(parse_u64(env, "SLEEP_TIME", 60)?),
-        error_throttle_sleep: Duration::from_secs(parse_u64(env, "ERROR_THROTTLE_SLEEP", 5)?),
+        // Zero would hot-loop the poll/restart paths — clamp to 1s.
+        sleep_time: Duration::from_secs(parse_u64(env, "SLEEP_TIME", 60)?.max(1)),
+        error_throttle_sleep: Duration::from_secs(
+            parse_u64(env, "ERROR_THROTTLE_SLEEP", 5)?.max(1),
+        ),
         req,
         fetch,
         skip_tls_verify: parse_bool(env.get("SKIP_TLS_VERIFY")),
@@ -810,5 +813,19 @@ mod tests {
             ("FOLDER_PER_NAMESPACE", "true"),
         ]);
         assert!(load(&e, &[]).unwrap().folder_per_namespace);
+    }
+
+    #[test]
+    fn zero_sleep_intervals_clamp_to_one_second() {
+        // A zero poll/throttle interval is a CPU hot-loop, not "instant".
+        let e = env(&[
+            ("LABEL", "x"),
+            ("FOLDER", "/tmp"),
+            ("SLEEP_TIME", "0"),
+            ("ERROR_THROTTLE_SLEEP", "0"),
+        ]);
+        let cfg = load(&e, &[]).unwrap();
+        assert_eq!(cfg.sleep_time, Duration::from_secs(1));
+        assert_eq!(cfg.error_throttle_sleep, Duration::from_secs(1));
     }
 }
