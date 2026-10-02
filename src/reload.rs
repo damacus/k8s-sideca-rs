@@ -11,7 +11,7 @@ use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
-use crate::config::{BasicAuthEncoding, Payload, ReqConfig, ReqMethod, RetryConfig};
+use crate::config::{BasicAuthEncoding, Payload, ReqConfig, ReqMethod};
 
 pub struct Reloader {
     cfg: ReqConfig,
@@ -85,7 +85,7 @@ impl Reloader {
                     let status = resp.status();
                     if status.is_server_error() && !self.cfg.common.enable_5xx {
                         if attempt < retries.total {
-                            delay = backoff(retries, attempt);
+                            delay = retries.backoff_delay(attempt);
                             warn!(status = %status, "reload returned 5xx; retrying");
                             continue;
                         }
@@ -95,7 +95,7 @@ impl Reloader {
                 }
                 Err(e) => {
                     if attempt < retries.total {
-                        delay = backoff(retries, attempt);
+                        delay = retries.backoff_delay(attempt);
                         continue;
                     }
                     return Err(e);
@@ -128,12 +128,6 @@ impl Reloader {
             .await
             .map_err(|e| e.to_string())
     }
-}
-
-fn backoff(retries: &RetryConfig, attempt: u32) -> Duration {
-    // urllib3-style exponential backoff.
-    let secs = retries.backoff_factor * 2f64.powi(attempt.saturating_sub(1) as i32);
-    Duration::from_secs_f64(secs.max(0.0))
 }
 
 /// Build the `Authorization: Basic …` header, re-reading credential files on
@@ -176,6 +170,7 @@ fn encode_basic(user: &str, pass: &str, enc: BasicAuthEncoding) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::RetryConfig;
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::sync::atomic::AtomicUsize;
