@@ -7,11 +7,37 @@ on:
 permissions:
   contents: write
   pull-requests: write
+  packages: write
+  id-token: write
+  attestations: write
 
 jobs:
   release-please:
     runs-on: ubuntu-latest
+    outputs:
+      release_created: ${{ steps.release.outputs.release_created }}
+      tag: ${{ steps.release.outputs.tag_name }}
+      version: ${{ steps.release.outputs.version }}
+      major: ${{ steps.release.outputs.major }}
+      minor: ${{ steps.release.outputs.minor }}
     steps:
       - uses: googleapis/release-please-action@v4
+        id: release
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
+
+  publish:
+    needs: release-please
+    if: needs.release-please.outputs.release_created == 'true'
+    uses: ./.github/workflows/release.yaml
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    secrets: inherit
+    with:
+      tag: ${{ needs.release-please.outputs.tag }}
+      version: ${{ needs.release-please.outputs.version }}
+      major: ${{ needs.release-please.outputs.major }}
+      minor: ${{ needs.release-please.outputs.minor }}

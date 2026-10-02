@@ -1,8 +1,42 @@
-name: release
+name: publish image
+
+# Called from release-please.yml after a release is cut (releases created by
+# GITHUB_TOKEN do not fire `release: published` workflows), and runnable by
+# hand to republish an existing tag.
 
 on:
-  release:
-    types: [published]
+  workflow_call:
+    inputs:
+      tag:
+        required: true
+        type: string
+        description: Git tag to build (e.g. v0.1.0)
+      version:
+        required: true
+        type: string
+        description: Bare semver (e.g. 0.1.0)
+      major:
+        required: true
+        type: string
+      minor:
+        required: true
+        type: string
+  workflow_dispatch:
+    inputs:
+      tag:
+        required: true
+        type: string
+        description: Git tag to build (e.g. v0.1.0)
+      version:
+        required: true
+        type: string
+        description: Bare semver (e.g. 0.1.0)
+      major:
+        required: true
+        type: string
+      minor:
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -15,6 +49,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag }}
 
       - uses: docker/setup-qemu-action@v3
       - uses: docker/setup-buildx-action@v3
@@ -30,9 +66,9 @@ jobs:
         with:
           images: ghcr.io/${{ github.repository }}
           tags: |
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=semver,pattern={{major}}
+            type=raw,value=${{ inputs.version }}
+            type=raw,value=${{ inputs.major }}.${{ inputs.minor }}
+            type=raw,value=${{ inputs.major }}
             type=sha
 
       - uses: docker/build-push-action@v6
