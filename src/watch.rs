@@ -120,7 +120,7 @@ pub async fn run_watcher(ctx: StreamCtx, kind: Kind, namespace: String) {
     loop {
         let wc = watcher::Config::default()
             .labels(&selector)
-            .timeout(ctx.cfg.watch_server_timeout as u32);
+            .timeout(u32::try_from(ctx.cfg.watch_server_timeout).unwrap_or(u32::MAX));
         let result = match kind {
             Kind::ConfigMap => {
                 let api = namespaced_api::<ConfigMap>(&ctx.client, &namespace);

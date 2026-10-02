@@ -228,6 +228,25 @@ fn parse_f64(
     }
 }
 
+/// Watch timeouts feed a `u32` apiserver parameter and the liveness
+/// heartbeat. `0` is not "no timeout": the server closes the watch
+/// immediately (hot reconnect loop) and a zero client read-timeout fails
+/// every request. Above `u32::MAX` silently truncates. Bound both.
+fn parse_watch_timeout(
+    env: &HashMap<String, String>,
+    var: &'static str,
+    default: u64,
+) -> Result<u64, ConfigError> {
+    let v = parse_u64(env, var, default)?;
+    if v == 0 || v > u64::from(u32::MAX) {
+        return Err(ConfigError::Invalid {
+            var,
+            value: env.get(var).cloned().unwrap_or_default(),
+        });
+    }
+    Ok(v)
+}
+
 fn parse_u32(
     env: &HashMap<String, String>,
     var: &'static str,
@@ -497,8 +516,8 @@ pub fn load(env: &HashMap<String, String>, args: &[String]) -> Result<Config, Co
         unique_filenames: parse_bool(env.get("UNIQUE_FILENAMES")),
         default_file_mode: parse_file_mode(env)?,
         kubeconfig: env.get("KUBECONFIG").cloned(),
-        watch_server_timeout: parse_u64(env, "WATCH_SERVER_TIMEOUT", 60)?,
-        watch_client_timeout: parse_u64(env, "WATCH_CLIENT_TIMEOUT", 66)?,
+        watch_server_timeout: parse_watch_timeout(env, "WATCH_SERVER_TIMEOUT", 60)?,
+        watch_client_timeout: parse_watch_timeout(env, "WATCH_CLIENT_TIMEOUT", 66)?,
         ignore_already_processed: parse_bool(env.get("IGNORE_ALREADY_PROCESSED")),
         k8s_contact_threshold: env
             .get("K8S_CONTACT_THRESHOLD_SECONDS")
@@ -835,6 +854,29 @@ mod tests {
         let cfg = load(&e, &[]).unwrap();
         assert_eq!(cfg.sleep_time, Duration::from_secs(1));
         assert_eq!(cfg.error_throttle_sleep, Duration::from_secs(1));
+    }
+
+    #[test]
+    fn zero_watch_timeouts_rejected() {
+        for var in ["WATCH_SERVER_TIMEOUT", "WATCH_CLIENT_TIMEOUT"] {
+            let e = env(&[("LABEL", "x"), ("FOLDER", "/tmp"), (var, "0")]);
+            assert!(
+                load(&e, &[]).is_err(),
+                "{var}=0 must be rejected — it hot-loops the stream"
+            );
+        }
+    }
+
+    #[test]
+    fn watch_timeout_above_u32_rejected() {
+        // watch_server_timeout is cast into a u32 apiserver parameter —
+        // larger values used to silently truncate.
+        let e = env(&[
+            ("LABEL", "x"),
+            ("FOLDER", "/tmp"),
+            ("WATCH_SERVER_TIMEOUT", "4294967296"),
+        ]);
+        assert!(load(&e, &[]).is_err());
     }
 
     #[test]
