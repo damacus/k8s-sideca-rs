@@ -530,7 +530,18 @@ pub fn load(env: &HashMap<String, String>, args: &[String]) -> Result<Config, Co
                     })
             })
             .transpose()?,
-        health_port: parse_u64(env, "HEALTH_PORT", 8080)? as u16,
+        // u16 via u64 parse: reject 0 (binds an ephemeral port — probes
+        // would never find it) and >65535 (silently truncated before).
+        health_port: {
+            let p = parse_u64(env, "HEALTH_PORT", 8080)?;
+            if p == 0 || p > u64::from(u16::MAX) {
+                return Err(ConfigError::Invalid {
+                    var: "HEALTH_PORT",
+                    value: env.get("HEALTH_PORT").cloned().unwrap_or_default(),
+                });
+            }
+            p as u16
+        },
         log_level: env
             .get("LOG_LEVEL")
             .cloned()
@@ -877,6 +888,16 @@ mod tests {
             ("WATCH_SERVER_TIMEOUT", "4294967296"),
         ]);
         assert!(load(&e, &[]).is_err());
+    }
+
+    #[test]
+    fn health_port_range_validated() {
+        for bad in ["0", "65536", "99999"] {
+            let e = env(&[("LABEL", "x"), ("FOLDER", "/tmp"), ("HEALTH_PORT", bad)]);
+            assert!(load(&e, &[]).is_err(), "HEALTH_PORT={bad} must be rejected");
+        }
+        let e = env(&[("LABEL", "x"), ("FOLDER", "/tmp"), ("HEALTH_PORT", "9090")]);
+        assert_eq!(load(&e, &[]).unwrap().health_port, 9090);
     }
 
     #[test]
