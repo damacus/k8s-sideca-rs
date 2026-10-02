@@ -263,11 +263,19 @@ where
     let api = namespaced_api::<T>(&ctx.client, namespace);
     let names = ctx.cfg.resource_names_for(kind, namespace);
     if names.is_empty() {
-        let lp = ListParams::default().labels(&selector(&ctx.cfg));
-        let list = api.list(&lp).await.map_err(|e| e.to_string())?;
-        ctx.health.contact(id);
-        for item in &list.items {
-            send_upsert(&ctx.tx, id, item).await?;
+        // Follow `continue` tokens — upstream lists unpaginated, which silently
+        // truncates if an apiserver decides to page the response.
+        let mut lp = ListParams::default().labels(&selector(&ctx.cfg)).limit(500);
+        loop {
+            let list = api.list(&lp).await.map_err(|e| e.to_string())?;
+            ctx.health.contact(id);
+            for item in &list.items {
+                send_upsert(&ctx.tx, id, item).await?;
+            }
+            match list.metadata.continue_ {
+                Some(token) if !token.is_empty() => lp = lp.continue_token(&token),
+                _ => break,
+            }
         }
     } else {
         for name in names {

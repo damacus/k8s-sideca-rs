@@ -1,9 +1,3 @@
-mod config;
-mod files;
-mod health;
-mod reload;
-mod watch;
-
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
@@ -16,11 +10,11 @@ use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 
-use config::{Config, LogFormat, Method, Namespaces, RetryConfig};
-use files::{Reconciler, UrlFetcher};
-use health::HealthState;
-use reload::Reloader;
-use watch::{SyncEvent, reconcile_loop, run_lister, run_watcher, stream_id};
+use k8s_sidecar_rs::config::{self, Config, LogFormat, Method, Namespaces, RetryConfig};
+use k8s_sidecar_rs::files::{Reconciler, UrlFetcher};
+use k8s_sidecar_rs::health::{self, HealthState};
+use k8s_sidecar_rs::reload::{self, Reloader};
+use k8s_sidecar_rs::watch::{self, SyncEvent, reconcile_loop, run_lister, run_watcher, stream_id};
 
 const SA_NAMESPACE_FILE: &str = "/var/run/secrets/kubernetes.io/serviceaccount/namespace";
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(10);

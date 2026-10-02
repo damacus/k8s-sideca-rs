@@ -26,4 +26,6 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
 webpki-roots = "1.0.9"
 
 [dev-dependencies]
+axum = "0.8.9"
 tempfile = "3.27.0"
+tokio-stream = "0.1.19"

@@ -138,7 +138,7 @@ fn backoff(retries: &RetryConfig, attempt: u32) -> Duration {
 
 /// Build the `Authorization: Basic …` header, re-reading credential files on
 /// every attempt (upstream does the same — supports rotation).
-pub(crate) fn basic_auth_header(cfg: &crate::config::FetchSettings) -> Option<String> {
+pub fn basic_auth_header(cfg: &crate::config::FetchSettings) -> Option<String> {
     let mut username = cfg.username.clone();
     let mut password = cfg.password.clone();
     if let Some(p) = &cfg.username_file {
