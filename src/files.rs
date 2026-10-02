@@ -324,7 +324,11 @@ impl Reconciler {
             // Only remove what this resource still owns in the manifest — a
             // path may have been taken over by another resource (collision).
             if self.manifest.files.get(stale) == Some(owner) {
-                changed |= remove_file(stale);
+                let outcome = remove_file(stale);
+                changed |= outcome.changed();
+                if outcome.gone() {
+                    self.manifest.files.remove(stale);
+                }
             }
         }
 
@@ -343,14 +347,25 @@ impl Reconciler {
     /// relist).
     pub fn remove(&mut self, owner: &Owner) -> io::Result<bool> {
         let mut changed = false;
+        let mut failed = BTreeSet::new();
         if let Some(st) = self.state.remove(&owner.key()) {
             for p in st.paths {
                 if self.manifest.files.get(&p) == Some(owner) {
-                    changed |= remove_file(&p);
+                    let outcome = remove_file(&p);
+                    changed |= outcome.changed();
+                    if outcome.gone() {
+                        self.manifest.files.remove(&p);
+                    } else {
+                        // Keep ownership of unremovable files so removal is
+                        // retried (restart cleanup / later delete event).
+                        failed.insert(p);
+                    }
                 }
             }
         }
-        self.manifest.files.retain(|_, o| o != owner);
+        self.manifest
+            .files
+            .retain(|p, o| o != owner || failed.contains(p));
         self.persist_manifest()?;
         Ok(changed)
     }
@@ -368,8 +383,9 @@ impl Reconciler {
             .collect();
         for (p, o) in stale {
             info!(path = %p.display(), owner = %o.key(), "removing stale owned file");
-            remove_file(&p);
-            self.manifest.files.remove(&p);
+            if remove_file(&p).gone() {
+                self.manifest.files.remove(&p);
+            }
         }
         self.persist_manifest()
     }
@@ -449,19 +465,40 @@ fn sync_dir(_path: &Path) -> io::Result<()> {
     Ok(())
 }
 
-fn remove_file(path: &Path) -> bool {
+/// Outcome of a remove attempt — "absent" and "failed" differ: an absent
+/// file is safe to forget in the manifest, a failed one must stay owned so
+/// removal is retried (e.g. on restart).
+enum RemoveOutcome {
+    Removed,
+    Absent,
+    Failed,
+}
+
+impl RemoveOutcome {
+    /// Whether the file contents on disk changed.
+    fn changed(&self) -> bool {
+        matches!(self, Self::Removed)
+    }
+
+    /// Whether the file is definitely gone — safe to drop ownership.
+    fn gone(&self) -> bool {
+        !matches!(self, Self::Failed)
+    }
+}
+
+fn remove_file(path: &Path) -> RemoveOutcome {
     match std::fs::remove_file(path) {
         Ok(()) => {
             info!(path = %path.display(), "removed file");
-            true
+            RemoveOutcome::Removed
         }
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
             debug!(path = %path.display(), "file already gone");
-            false
+            RemoveOutcome::Absent
         }
         Err(e) => {
             error!(path = %path.display(), error = %e, "failed to remove file");
-            false
+            RemoveOutcome::Failed
         }
     }
 }
@@ -843,6 +880,61 @@ mod tests {
         assert!(
             !rec.already_processed(&owner(), Some("7")),
             "failed apply must not consume the resource_version"
+        );
+    }
+
+    /// Make removal of `folder/a` fail by swapping the file for a directory.
+    fn replace_owned_file_with_dir(folder: &Path) {
+        std::fs::remove_file(folder.join("a")).unwrap();
+        std::fs::create_dir_all(folder.join("a/sub")).unwrap();
+    }
+
+    #[tokio::test]
+    async fn failed_remove_keeps_manifest_ownership() {
+        // If unlink fails, the sidecar still owns that path — dropping the
+        // manifest entry would orphan the file and never retry.
+        let tmp = TempDir::new().unwrap();
+        let folder = tmp.path().to_path_buf();
+        let mut rec = Reconciler::load(&folder, None, false);
+        let planned = plan_files(
+            &folder,
+            &owner(),
+            &texts(&[("a", "1")]),
+            &BTreeMap::new(),
+            false,
+        );
+        rec.apply(&owner(), planned, None, &NoFetch).await.unwrap();
+        replace_owned_file_with_dir(&folder);
+
+        rec.remove(&owner()).unwrap();
+        assert!(folder.join("a").is_dir(), "directory must survive removal");
+        assert_eq!(
+            rec.manifest().files.get(&folder.join("a")),
+            Some(&owner()),
+            "failed removal must keep the manifest entry"
+        );
+    }
+
+    #[tokio::test]
+    async fn cleanup_stale_keeps_manifest_on_failed_remove() {
+        let tmp = TempDir::new().unwrap();
+        let folder = tmp.path().to_path_buf();
+        let mut rec = Reconciler::load(&folder, None, false);
+        let planned = plan_files(
+            &folder,
+            &owner(),
+            &texts(&[("a", "1")]),
+            &BTreeMap::new(),
+            false,
+        );
+        rec.apply(&owner(), planned, None, &NoFetch).await.unwrap();
+        replace_owned_file_with_dir(&folder);
+
+        rec.cleanup_stale(&BTreeSet::new()).unwrap();
+        assert_eq!(
+            rec.manifest().files.get(&folder.join("a")),
+            Some(&owner()),
+            "failed stale removal must keep the manifest entry"
         );
     }
 
