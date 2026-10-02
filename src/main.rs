@@ -7,7 +7,7 @@ use kube::Client;
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 use k8s_sidecar_rs::config::{self, Config, LogFormat, Method, Namespaces};
@@ -42,6 +42,9 @@ async fn run() -> i32 {
     };
     init_logging(&cfg);
     info!("starting collector");
+    if cfg.resource_name_ignored() {
+        warn!("RESOURCE_NAME has no effect with NAMESPACE=ALL; selectors are ignored");
+    }
     rustls::crypto::ring::default_provider()
         .install_default()
         .ok();

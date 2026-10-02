@@ -259,6 +259,15 @@ impl Config {
             .map(|s| s.name.clone())
             .collect()
     }
+
+    /// `RESOURCE_NAME` has no effect in cluster-wide mode (`NAMESPACE=ALL`):
+    /// namespaced selectors never match the single "ALL" stream, and unscoped
+    /// names `GET` on a cluster-scoped `Api::all` URL, which 404s for
+    /// namespaced kinds. Upstream has the same limitation but says nothing;
+    /// we warn at startup.
+    pub fn resource_name_ignored(&self) -> bool {
+        self.namespaces == Namespaces::All && !self.resource_names.is_empty()
+    }
 }
 
 fn parse_bool(value: Option<&String>) -> bool {
@@ -697,6 +706,24 @@ mod tests {
         assert!(!cfg.ignore_already_processed);
         assert_eq!(cfg.default_file_mode, None);
         assert!(cfg.req.is_none());
+    }
+
+    #[test]
+    fn resource_name_with_namespace_all_is_flagged() {
+        let mut e = base();
+        e.insert("NAMESPACE".into(), "ALL".into());
+        e.insert("RESOURCE_NAME".into(), "grafana".into());
+        assert!(load(&e, &[]).unwrap().resource_name_ignored());
+        e.remove("RESOURCE_NAME");
+        assert!(!load(&e, &[]).unwrap().resource_name_ignored());
+    }
+
+    #[test]
+    fn resource_name_with_single_namespace_is_not_ignored() {
+        let mut e = base();
+        e.insert("NAMESPACE".into(), "default".into());
+        e.insert("RESOURCE_NAME".into(), "grafana".into());
+        assert!(!load(&e, &[]).unwrap().resource_name_ignored());
     }
 
     #[test]
