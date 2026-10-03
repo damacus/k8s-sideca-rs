@@ -8,6 +8,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
+use std::time::Duration;
 
 use futures_util::StreamExt;
 use k8s_openapi::api::core::v1::{ConfigMap, Secret};
@@ -165,12 +166,39 @@ where
     }
 }
 
+/// Outcome of waiting for the next watch event with a silence bound.
+enum NextEvent<E> {
+    /// The stream yielded (`Some`) or ended (`None`).
+    Event(Option<E>),
+    /// No event arrived within the idle timeout — the stream may be
+    /// half-open; the caller should reconnect.
+    Idle,
+    Cancelled,
+}
+
+/// `events.next()` with a client-side read-silence bound (`WATCH_CLIENT_TIMEOUT`)
+/// and cancellation. The apiserver's `timeoutSeconds` cannot reach a dead TCP
+/// connection, and reqwest's `read_timeout` does not cover reads mid-body — an
+/// unbounded `next()` can hang forever, which is how a stream goes stale while
+/// the process looks healthy.
+async fn next_event<E>(
+    next: impl Future<Output = Option<E>>,
+    idle: Duration,
+    cancel: &CancellationToken,
+) -> NextEvent<E> {
+    tokio::select! {
+        _ = cancel.cancelled() => NextEvent::Cancelled,
+        _ = tokio::time::sleep(idle) => NextEvent::Idle,
+        e = next => NextEvent::Event(e),
+    }
+}
+
 async fn watch_stream<T>(
     api: Api<T>,
     wc: watcher::Config,
     ctx: &StreamCtx,
     id: &str,
-) -> Result<(), watcher::Error>
+) -> Result<(), String>
 where
     T: kube::Resource
         + Clone
@@ -183,13 +211,17 @@ where
     T::DynamicType: Default,
 {
     let mut events = std::pin::pin!(watcher::watcher(api, wc));
+    let idle_timeout = Duration::from_secs(ctx.cfg.watch_client_timeout);
     loop {
-        let next = tokio::select! {
-            _ = ctx.cancel.cancelled() => return Ok(()),
-            e = events.next() => e,
-        };
-        let Some(result) = next else {
-            return Ok(()); // stream ended; caller restarts
+        let result = match next_event(events.next(), idle_timeout, &ctx.cancel).await {
+            NextEvent::Cancelled | NextEvent::Event(None) => return Ok(()),
+            NextEvent::Idle => {
+                // WATCH_CLIENT_TIMEOUT bounds read silence: a half-open
+                // connection emits nothing forever — force a reconnect so the
+                // stream re-lists instead of wedging (and going stale).
+                return Err(format!("watch idle for {idle_timeout:?}; reconnecting"));
+            }
+            NextEvent::Event(Some(result)) => result,
         };
         ctx.health.contact(id);
         let send = match result {
@@ -198,7 +230,7 @@ where
                 ctx.health.stream_alive(id);
                 map_event(e, id)
             }
-            Err(e) => return Err(e),
+            Err(e) => return Err(e.to_string()),
         };
         if ctx.tx.send(send).await.is_err() {
             return Ok(());
@@ -547,6 +579,45 @@ mod tests {
         tx: mpsc::Sender<SyncEvent>,
         folder: PathBuf,
         cancel: CancellationToken,
+    }
+
+    #[tokio::test]
+    async fn next_event_times_out_on_silent_stream() {
+        let cancel = CancellationToken::new();
+        let out = next_event(
+            std::future::pending::<Option<()>>(),
+            Duration::from_millis(50),
+            &cancel,
+        )
+        .await;
+        assert!(matches!(out, NextEvent::Idle));
+    }
+
+    #[tokio::test]
+    async fn next_event_passes_items_and_stream_end() {
+        let cancel = CancellationToken::new();
+        let t = Duration::from_secs(60);
+        assert!(matches!(
+            next_event(std::future::ready(Some(42)), t, &cancel).await,
+            NextEvent::Event(Some(42))
+        ));
+        assert!(matches!(
+            next_event(std::future::ready(None::<i32>), t, &cancel).await,
+            NextEvent::Event(None)
+        ));
+    }
+
+    #[tokio::test]
+    async fn next_event_cancel_wins_over_idle() {
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let out = next_event(
+            std::future::pending::<Option<()>>(),
+            Duration::from_millis(50),
+            &cancel,
+        )
+        .await;
+        assert!(matches!(out, NextEvent::Cancelled));
     }
 
     async fn harness(

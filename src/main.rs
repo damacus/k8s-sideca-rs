@@ -262,6 +262,7 @@ async fn build_client(cfg: &Config) -> Result<Client, String> {
         kcfg.accept_invalid_certs = true;
     }
     kcfg.read_timeout = Some(Duration::from_secs(cfg.watch_client_timeout));
+    kcfg.connect_timeout = Some(Duration::from_secs(cfg.watch_client_timeout));
     Client::try_from(kcfg).map_err(|e| e.to_string())
 }
 
