@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.2](https://github.com/damacus/k8s-sidecar-rs/compare/v0.2.1...v0.2.2) (2026-10-03)
+
+
+### Bug Fixes
+
+* **watch:** bound watch event wait by WATCH_CLIENT_TIMEOUT ([#35](https://github.com/damacus/k8s-sidecar-rs/issues/35)) ([3721961](https://github.com/damacus/k8s-sidecar-rs/commit/372196189f1ad0ef6acb4eb61141ebd21c41a6f5))
+
 ## [0.2.1](https://github.com/damacus/k8s-sidecar-rs/compare/v0.2.0...v0.2.1) (2026-10-02)
 
 
