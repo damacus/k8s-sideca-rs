@@ -103,7 +103,12 @@ pub async fn serve(state: Arc<HealthState>, port: u16, cancel: CancellationToken
     let listener = match bind(port) {
         Some(l) => l,
         None => {
+            // Upstream ran the health server on a daemon thread — a bind
+            // failure (e.g. two sidecars sharing a pod's network) killed
+            // only that thread, never file sync. Park until shutdown so a
+            // completed health task can't trip main's worker-death path.
             error!(port, "health server failed to bind");
+            cancel.cancelled().await;
             return;
         }
     };
@@ -115,6 +120,7 @@ pub async fn serve(state: Arc<HealthState>, port: u16, cancel: CancellationToken
     // leak the thread (and the bound port) past shutdown.
     if let Err(e) = listener.set_nonblocking(true) {
         error!(port, error = %e, "health server failed to configure listener");
+        cancel.cancelled().await;
         return;
     }
     let (tx, mut rx) = tokio::sync::mpsc::channel::<std::net::TcpStream>(16);
@@ -312,6 +318,37 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status().as_u16(), 404);
         cancel.cancel();
+    }
+
+    #[tokio::test]
+    async fn bind_conflict_parks_instead_of_exiting() {
+        // Upstream parity: the health server ran on a daemon thread, so a
+        // port conflict (e.g. two sidecars sharing a pod) killed only that
+        // thread — file sync kept running. The task must stay pending until
+        // shutdown; main treats any completed worker as fatal.
+        let state = HealthState::new(None);
+        let port = {
+            let l = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+            l.local_addr().unwrap().port()
+        };
+        // Occupy the port on both stacks so neither bind attempt succeeds —
+        // `::` may already dual-stack-cover v4, and v6 may be absent.
+        let _hold_v6 = TcpListener::bind(("::", port));
+        let _hold_v4 = TcpListener::bind(("0.0.0.0", port));
+
+        let cancel = CancellationToken::new();
+        let task = tokio::spawn(serve(state, port, cancel.clone()));
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(
+            !task.is_finished(),
+            "health task must park on bind failure, not exit"
+        );
+
+        cancel.cancel();
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("parked task must still observe cancellation")
+            .unwrap();
     }
 
     #[tokio::test]
