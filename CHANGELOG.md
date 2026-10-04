@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.4](https://github.com/damacus/k8s-sidecar-rs/compare/v0.2.3...v0.2.4) (2026-10-04)
+
+
+### Bug Fixes
+
+* **health:** park health task on bind failure instead of exiting ([#39](https://github.com/damacus/k8s-sidecar-rs/issues/39)) ([bf4ce0c](https://github.com/damacus/k8s-sidecar-rs/commit/bf4ce0c9046716e63ff87a2599516515e426ee55))
+
 ## [0.2.3](https://github.com/damacus/k8s-sidecar-rs/compare/v0.2.2...v0.2.3) (2026-10-04)
 
 
