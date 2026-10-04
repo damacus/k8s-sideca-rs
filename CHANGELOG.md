@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.3](https://github.com/damacus/k8s-sidecar-rs/compare/v0.2.2...v0.2.3) (2026-10-04)
+
+
+### Bug Fixes
+
+* **watch:** log routine stream rotation at info, not error ([#37](https://github.com/damacus/k8s-sidecar-rs/issues/37)) ([5e2e513](https://github.com/damacus/k8s-sidecar-rs/commit/5e2e513022fd0bfd39db29bad78b4078131c65a8))
+
 ## [0.2.2](https://github.com/damacus/k8s-sidecar-rs/compare/v0.2.1...v0.2.2) (2026-10-03)
 
 
