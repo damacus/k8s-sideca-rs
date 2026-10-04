@@ -142,7 +142,13 @@ pub async fn run_watcher(ctx: StreamCtx, kind: Kind, namespace: String) {
             ctx.health.contact(&id);
         }
         ctx.health.stream_dead(&id);
-        error!(stream = %id, error = ?result, "watch stream ended; restarting");
+        match &result {
+            Err(e) if stream_end_level(&result) == tracing::Level::ERROR => {
+                error!(stream = %id, error = %e, "watch stream ended; restarting")
+            }
+            Err(e) => info!(stream = %id, reason = %e, "watch stream ended; restarting"),
+            Ok(()) => info!(stream = %id, "watch stream ended; restarting"),
+        }
         tokio::select! {
             _ = ctx.cancel.cancelled() => return,
             _ = tokio::time::sleep(ctx.cfg.error_throttle_sleep) => {}
@@ -193,12 +199,41 @@ async fn next_event<E>(
     }
 }
 
+/// Why a watch stream ended. A routine stream rotation — a clean close or
+/// an idle-timeout reconnect — is expected behaviour, so `run_watcher` logs
+/// it at info instead of error.
+#[derive(Debug)]
+enum WatchEnd {
+    /// Forced reconnect after `WATCH_CLIENT_TIMEOUT` of read silence.
+    Idle(Duration),
+    /// Transport or list failure reported by the watcher.
+    Other(String),
+}
+
+impl std::fmt::Display for WatchEnd {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            WatchEnd::Idle(d) => write!(f, "watch idle for {d:?}; reconnecting"),
+            WatchEnd::Other(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+/// Real failures log at error; routine ends (clean close, idle reconnect)
+/// log at info — they are the reconnect cadence, not a fault.
+fn stream_end_level(result: &Result<(), WatchEnd>) -> tracing::Level {
+    match result {
+        Err(WatchEnd::Other(_)) => tracing::Level::ERROR,
+        _ => tracing::Level::INFO,
+    }
+}
+
 async fn watch_stream<T>(
     api: Api<T>,
     wc: watcher::Config,
     ctx: &StreamCtx,
     id: &str,
-) -> Result<(), String>
+) -> Result<(), WatchEnd>
 where
     T: kube::Resource
         + Clone
@@ -219,7 +254,7 @@ where
                 // WATCH_CLIENT_TIMEOUT bounds read silence: a half-open
                 // connection emits nothing forever — force a reconnect so the
                 // stream re-lists instead of wedging (and going stale).
-                return Err(format!("watch idle for {idle_timeout:?}; reconnecting"));
+                return Err(WatchEnd::Idle(idle_timeout));
             }
             NextEvent::Event(Some(result)) => result,
         };
@@ -230,7 +265,7 @@ where
                 ctx.health.stream_alive(id);
                 map_event(e, id)
             }
-            Err(e) => return Err(e.to_string()),
+            Err(e) => return Err(WatchEnd::Other(e.to_string())),
         };
         if ctx.tx.send(send).await.is_err() {
             return Ok(());
@@ -618,6 +653,26 @@ mod tests {
         )
         .await;
         assert!(matches!(out, NextEvent::Cancelled));
+    }
+
+    #[test]
+    fn stream_end_levels() {
+        use tracing::Level;
+        assert_eq!(
+            stream_end_level(&Err(WatchEnd::Idle(Duration::from_secs(60)))),
+            Level::INFO,
+            "routine idle reconnect is not an error"
+        );
+        assert_eq!(
+            stream_end_level(&Ok(())),
+            Level::INFO,
+            "server-close is routine stream rotation"
+        );
+        assert_eq!(
+            stream_end_level(&Err(WatchEnd::Other("boom".into()))),
+            Level::ERROR,
+            "transport failures stay errors"
+        );
     }
 
     async fn harness(
