@@ -60,10 +60,10 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use futures_util::StreamExt;
-use k8s_sidecar_rs::config::{self, Config, Kind};
-use k8s_sidecar_rs::files::{Reconciler, UrlFetcher};
-use k8s_sidecar_rs::health::HealthState;
-use k8s_sidecar_rs::watch::{
+use k8s_sideca_rs::config::{self, Config, Kind};
+use k8s_sideca_rs::files::{Reconciler, UrlFetcher};
+use k8s_sideca_rs::health::HealthState;
+use k8s_sideca_rs::watch::{
     ReconcileCtx, StreamCtx, reconcile_loop, run_lister, run_watcher, stream_id,
 };
 use serde_json::{Value, json};

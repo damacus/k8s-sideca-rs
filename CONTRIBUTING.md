@@ -24,5 +24,5 @@ replicate upstream bugs.
 
 Releases are automated: merge the release-please PR on `main` to cut a
 versioned release; the publish workflow pushes multi-arch images to
-`ghcr.io/damacus/k8s-sidecar-rs` with semver tags, `sha-*`, an SBOM and
+`ghcr.io/damacus/k8s-sideca-rs` with semver tags, `sha-*`, an SBOM and
 build provenance attestation.

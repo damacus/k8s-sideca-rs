@@ -53,12 +53,12 @@ use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
-use k8s_sidecar_rs::config::{self, Config, LogFormat, Method, Namespaces};
-use k8s_sidecar_rs::files::{Reconciler, UrlFetcher};
-use k8s_sidecar_rs::health::{self, HealthState};
-use k8s_sidecar_rs::http::build_req_client;
-use k8s_sidecar_rs::reload::{self, Reloader};
-use k8s_sidecar_rs::watch::{self, SyncEvent, reconcile_loop, run_lister, run_watcher, stream_id};
+use k8s_sideca_rs::config::{self, Config, LogFormat, Method, Namespaces};
+use k8s_sideca_rs::files::{Reconciler, UrlFetcher};
+use k8s_sideca_rs::health::{self, HealthState};
+use k8s_sideca_rs::http::build_req_client;
+use k8s_sideca_rs::reload::{self, Reloader};
+use k8s_sideca_rs::watch::{self, SyncEvent, reconcile_loop, run_lister, run_watcher, stream_id};
 
 const SA_NAMESPACE_FILE: &str = "/var/run/secrets/kubernetes.io/serviceaccount/namespace";
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(10);

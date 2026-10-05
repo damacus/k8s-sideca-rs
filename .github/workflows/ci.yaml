@@ -31,4 +31,4 @@ jobs:
           context: .
           push: false
           platforms: linux/amd64
-          tags: k8s-sidecar-rs:test
+          tags: k8s-sideca-rs:test

@@ -1,4 +1,4 @@
-# k8s-sidecar-rs
+# k8s-sideca-rs
 
 Rust reimplementation of [kiwigrid/k8s-sidecar](https://github.com/kiwigrid/k8s-sidecar)
 (pinned compatibility target: upstream `2.11.2`).
@@ -39,7 +39,7 @@ Port in progress — not yet released or deployed.
 
 - **Atomic writes** — files are written to a temp path then renamed; upstream
   writes in place.
-- **Ownership manifest** — `.k8s-sidecar-rs.manifest.json` tracks which files
+- **Ownership manifest** — `.k8s-sideca-rs.manifest.json` tracks which files
   this sidecar owns, so a restart cleans owned stale files without touching
   unrelated files. Upstream leaves stale files across restarts.
   The manifest lives inside `FOLDER` — the only guaranteed-writable path.

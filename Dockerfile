@@ -5,9 +5,9 @@ WORKDIR /src
 COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
 COPY src ./src
 RUN cargo build --release --locked \
-    && file target/release/k8s-sidecar-rs | grep -q "static-pie linked\|statically linked"
+    && file target/release/k8s-sideca-rs | grep -q "static-pie linked\|statically linked"
 
 FROM scratch
-COPY --from=builder /src/target/release/k8s-sidecar-rs /k8s-sidecar-rs
+COPY --from=builder /src/target/release/k8s-sideca-rs /k8s-sideca-rs
 USER 65534:65534
-ENTRYPOINT ["/k8s-sidecar-rs"]
+ENTRYPOINT ["/k8s-sideca-rs"]

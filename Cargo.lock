@@ -1097,7 +1097,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "k8s-sidecar-rs"
+name = "k8s-sideca-rs"
 version = "0.2.4"
 dependencies = [
  "axum",

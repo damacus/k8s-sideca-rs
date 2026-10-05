@@ -50,8 +50,8 @@ use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::sync::Arc;
 
-use k8s_sidecar_rs::config::{self, Config};
-use k8s_sidecar_rs::http::build_req_client;
+use k8s_sideca_rs::config::{self, Config};
+use k8s_sideca_rs::http::build_req_client;
 
 /// Serve HTTPS on a self-signed "localhost" cert; reply 200 to each request.
 fn serve_self_signed() -> String {
