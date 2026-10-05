@@ -10,6 +10,32 @@
         "major"
       ],
       "automerge": false
+    },
+    {
+      "description": "Automerge non-major dependency updates once CI passes",
+      "matchUpdateTypes": [
+        "minor",
+        "patch",
+        "digest",
+        "pin"
+      ],
+      "automerge": true,
+      "automergeType": "pr",
+      "platformAutomerge": true
+    },
+    {
+      "description": "Automerge toolchain/base-image pins within the same major",
+      "matchManagers": [
+        "dockerfile",
+        "rust"
+      ],
+      "matchUpdateTypes": [
+        "minor",
+        "patch"
+      ],
+      "automerge": true,
+      "automergeType": "pr",
+      "platformAutomerge": true
     }
   ]
 }
