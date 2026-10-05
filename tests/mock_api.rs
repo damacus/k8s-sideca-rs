@@ -1,3 +1,46 @@
+#![warn(
+    clippy::pedantic,
+    clippy::nursery,
+    clippy::cargo,
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing,
+    clippy::exit,
+    clippy::dbg_macro,
+    clippy::todo,
+    clippy::unimplemented,
+    clippy::unreachable,
+    clippy::undocumented_unsafe_blocks,
+    clippy::as_conversions
+)]
+#![allow(
+    // Transitive duplicate versions are outside our control.
+    clippy::multiple_crate_versions,
+    // Error behaviour is documented at module level, not via per-fn
+    // Errors sections; the public surface is consumed internally.
+    clippy::missing_errors_doc,
+    clippy::missing_panics_doc,
+    // Function length is governed by cognitive-complexity, not lines.
+    clippy::too_many_lines,
+    // Licence/keyword metadata is a maintainer decision, not a lint.
+    clippy::cargo_common_metadata,
+)]
+#![cfg_attr(
+    test,
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing,
+        clippy::unreachable,
+        clippy::disallowed_methods,
+        clippy::future_not_send,
+        clippy::assert_is_empty,
+        // Fake/test impls are async only because the real trait is.
+        clippy::unused_async_trait_impl,
+    )
+)]
 //! Mock Kubernetes API integration tests: real `run_watcher` / `run_lister`
 //! / `reconcile_loop` against an in-process fake apiserver covering initial
 //! sync, watch events, disconnect/reconnect, HTTP 410 relist recovery and
@@ -95,7 +138,7 @@ impl MockKube {
         };
         obj["metadata"]["resourceVersion"] = json!(i.rv.to_string());
         i.items.insert(key, obj.clone());
-        broadcast(&mut i, resource, ns, typ, &obj);
+        broadcast(i, resource, ns, typ, &obj);
     }
 
     fn delete_cm(&self, ns: &str, name: &str) {
@@ -103,7 +146,7 @@ impl MockKube {
         i.rv += 1;
         let key = ("configmaps".to_string(), ns.to_string(), name.to_string());
         if let Some(obj) = i.items.remove(&key) {
-            broadcast(&mut i, "configmaps", ns, "DELETED", &obj);
+            broadcast(i, "configmaps", ns, "DELETED", &obj);
         }
     }
 
@@ -132,7 +175,13 @@ impl MockKube {
     }
 }
 
-fn broadcast(i: &mut Inner, resource: &str, ns: &str, typ: &str, obj: &Value) {
+fn broadcast(
+    mut i: std::sync::MutexGuard<Inner>,
+    resource: &str,
+    ns: &str,
+    typ: &str,
+    obj: &Value,
+) {
     let line = format!("{}\n", json!({"type": typ, "object": obj}));
     i.watchers.retain(|w| {
         if w.resource != resource {
@@ -184,11 +233,11 @@ fn base64_encode(b: &[u8]) -> String {
     const T: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::new();
     for chunk in b.chunks(3) {
-        let n = chunk.iter().fold(0u32, |a, &b| (a << 8) | b as u32) << (8 * (3 - chunk.len()));
+        let n = chunk.iter().fold(0u32, |a, &b| (a << 8) | u32::from(b)) << (8 * (3 - chunk.len()));
         for i in 0..4 {
-            let idx = ((n >> (18 - 6 * i)) & 63) as usize;
+            let idx = usize::try_from((n >> (18 - 6 * i)) & 63).unwrap_or(0);
             out.push(if i < chunk.len() + 1 {
-                T[idx] as char
+                char::from(T[idx])
             } else {
                 '='
             });
@@ -218,7 +267,7 @@ async fn list_all(
     AxPath(resource): AxPath<String>,
     Query(q): Query<Params>,
 ) -> Response {
-    respond_list_or_watch(mock, None, resource, q).await
+    respond_list_or_watch(&mock, None, resource, &q)
 }
 
 async fn list_ns(
@@ -226,16 +275,17 @@ async fn list_ns(
     AxPath((ns, resource)): AxPath<(String, String)>,
     Query(q): Query<Params>,
 ) -> Response {
-    respond_list_or_watch(mock, Some(ns), resource, q).await
+    respond_list_or_watch(&mock, Some(ns), resource, &q)
 }
 
-async fn respond_list_or_watch(
-    mock: Arc<Mutex<Inner>>,
+fn respond_list_or_watch(
+    mock: &Mutex<Inner>,
     ns: Option<String>,
     resource: String,
-    q: Params,
+    q: &Params,
 ) -> Response {
-    if let Some(code) = mock.lock().unwrap().fail_all {
+    let fail_all = mock.lock().unwrap().fail_all;
+    if let Some(code) = fail_all {
         return (
             StatusCode::from_u16(code).unwrap(),
             axum::Json(json!({
@@ -249,10 +299,12 @@ async fn respond_list_or_watch(
     if q.get("watch").is_some_and(|v| v == "true" || v == "1") {
         return watch_response(mock, ns, resource);
     }
-    let i = mock.lock().unwrap();
+    let (all_items, rv, page_size) = {
+        let i = mock.lock().unwrap();
+        (i.items.clone(), i.rv, i.page_size)
+    };
     let selector = q.get("labelSelector").cloned().unwrap_or_default();
-    let mut items: Vec<Value> = i
-        .items
+    let mut items: Vec<Value> = all_items
         .iter()
         .filter(|((r, ins, _), obj)| {
             r == &resource
@@ -268,7 +320,7 @@ async fn respond_list_or_watch(
             .to_string()
     });
 
-    let limit = q.get("limit").and_then(|v| v.parse().ok()).or(i.page_size);
+    let limit = q.get("limit").and_then(|v| v.parse().ok()).or(page_size);
     let offset = q
         .get("continue")
         .and_then(|t| t.parse::<usize>().ok())
@@ -279,7 +331,7 @@ async fn respond_list_or_watch(
         }
         _ => (items[offset.min(items.len())..].to_vec(), None),
     };
-    let mut meta = json!({"resourceVersion": i.rv.to_string()});
+    let mut meta = json!({"resourceVersion": rv.to_string()});
     if let Some(c) = next {
         meta["continue"] = json!(c.to_string());
     }
@@ -300,7 +352,7 @@ async fn respond_list_or_watch(
         .into_response()
 }
 
-fn watch_response(mock: Arc<Mutex<Inner>>, ns: Option<String>, resource: String) -> Response {
+fn watch_response(mock: &Mutex<Inner>, ns: Option<String>, resource: String) -> Response {
     let mut i = mock.lock().unwrap();
     if let Some(code) = i.fail_watch.take() {
         return (
@@ -315,6 +367,7 @@ fn watch_response(mock: Arc<Mutex<Inner>>, ns: Option<String>, resource: String)
     }
     let (tx, rx) = mpsc::unbounded_channel::<String>();
     i.watchers.push(Watcher { ns, resource, tx });
+    drop(i);
     let stream =
         UnboundedReceiverStream::new(rx).map(|line| Ok::<Bytes, Infallible>(Bytes::from(line)));
     Response::builder()
@@ -328,18 +381,20 @@ async fn get_one(
     AxPath((ns, resource, name)): AxPath<(String, String, String)>,
 ) -> Response {
     let i = mock.lock().unwrap();
-    match i.items.get(&(resource, ns, name)) {
-        Some(obj) => (StatusCode::OK, axum::Json(obj.clone())).into_response(),
-        None => (
-            StatusCode::NOT_FOUND,
-            axum::Json(json!({
-                "kind": "Status", "apiVersion": "v1", "status": "Failure",
-                "reason": "NotFound", "code": 404,
-                "message": "not found",
-            })),
-        )
-            .into_response(),
-    }
+    i.items.get(&(resource, ns, name)).map_or_else(
+        || {
+            (
+                StatusCode::NOT_FOUND,
+                axum::Json(json!({
+                    "kind": "Status", "apiVersion": "v1", "status": "Failure",
+                    "reason": "NotFound", "code": 404,
+                    "message": "not found",
+                })),
+            )
+                .into_response()
+        },
+        |obj| (StatusCode::OK, axum::Json(obj.clone())).into_response(),
+    )
 }
 
 // ------------------------------------------------------------ test harness
@@ -382,10 +437,10 @@ fn client_to(url: &str) -> kube::Client {
 
 /// Wire one (kind, namespace) stream + the reconcile loop, mirroring main.rs:
 /// `effective_method` picks watcher vs lister; `METHOD=LIST` runs a single pass.
-async fn spawn_sidecar(mock: &MockKube, cfg: Arc<Config>, kind: Kind, ns: &str) -> Sidecar {
+fn spawn_sidecar(mock: &MockKube, cfg: &Config, kind: Kind, ns: &str) -> Sidecar {
     let dir = tempfile::tempdir().unwrap();
     let cfg = {
-        let mut c = (*cfg).clone();
+        let mut c = cfg.clone();
         c.folder = dir.path().to_path_buf();
         Arc::new(c)
     };
@@ -484,7 +539,7 @@ async fn watcher_initial_sync_writes_files() {
     mock.upsert_cm("ns1", "cm-a", &[("a.json", "{\"a\":1}")]);
     let dir = tempfile::tempdir().unwrap();
     let cfg = cfg_for(dir.path(), &[]);
-    let sc = spawn_sidecar(&mock, cfg, Kind::ConfigMap, "ns1").await;
+    let sc = spawn_sidecar(&mock, &cfg, Kind::ConfigMap, "ns1");
 
     assert_eq!(wait_file(&sc.dir, "a.json").await, "{\"a\":1}");
     sc.cancel.cancel();
@@ -495,7 +550,7 @@ async fn watcher_add_modify_delete_events() {
     let mock = MockKube::start().await;
     let dir = tempfile::tempdir().unwrap();
     let cfg = cfg_for(dir.path(), &[]);
-    let sc = spawn_sidecar(&mock, cfg, Kind::ConfigMap, "ns1").await;
+    let sc = spawn_sidecar(&mock, &cfg, Kind::ConfigMap, "ns1");
 
     mock.upsert_cm("ns1", "cm-b", &[("b.txt", "one")]);
     wait_file(&sc.dir, "b.txt").await;
@@ -514,7 +569,7 @@ async fn watcher_secret_bytes_written() {
     mock.upsert_secret("ns1", "s1", &[("bin", b"\x00\x01\xff")]);
     let dir = tempfile::tempdir().unwrap();
     let cfg = cfg_for(dir.path(), &[("RESOURCE", "both")]);
-    let sc = spawn_sidecar(&mock, cfg, Kind::Secret, "ns1").await;
+    let sc = spawn_sidecar(&mock, &cfg, Kind::Secret, "ns1");
 
     let p = file(&sc.dir, "bin");
     assert!(wait_for(|| p.exists()).await);
@@ -528,7 +583,7 @@ async fn watcher_reconnects_after_stream_close() {
     mock.upsert_cm("ns1", "cm-a", &[("a.json", "v1")]);
     let dir = tempfile::tempdir().unwrap();
     let cfg = cfg_for(dir.path(), &[]);
-    let sc = spawn_sidecar(&mock, cfg, Kind::ConfigMap, "ns1").await;
+    let sc = spawn_sidecar(&mock, &cfg, Kind::ConfigMap, "ns1");
     wait_file(&sc.dir, "a.json").await;
     assert!(wait_for(|| mock.watch_count() > 0).await);
 
@@ -546,7 +601,7 @@ async fn watcher_recovers_from_410_gone() {
     mock.upsert_cm("ns1", "cm-a", &[("a.json", "v1")]);
     let dir = tempfile::tempdir().unwrap();
     let cfg = cfg_for(dir.path(), &[]);
-    let sc = spawn_sidecar(&mock, cfg, Kind::ConfigMap, "ns1").await;
+    let sc = spawn_sidecar(&mock, &cfg, Kind::ConfigMap, "ns1");
     wait_file(&sc.dir, "a.json").await;
     assert!(wait_for(|| mock.watch_count() > 0).await);
 
@@ -569,7 +624,7 @@ async fn lister_follows_paginated_list() {
     mock.set_page_size(2); // 5 items over pages of 2 -> exercises continue tokens
     let dir = tempfile::tempdir().unwrap();
     let cfg = cfg_for(dir.path(), &[("METHOD", "SLEEP"), ("SLEEP_TIME", "3600")]);
-    let sc = spawn_sidecar(&mock, cfg, Kind::ConfigMap, "ns1").await;
+    let sc = spawn_sidecar(&mock, &cfg, Kind::ConfigMap, "ns1");
 
     for n in 0..5 {
         assert_eq!(
@@ -590,7 +645,7 @@ async fn lister_resource_name_get_and_404() {
         dir.path(),
         &[("METHOD", "LIST"), ("RESOURCE_NAME", "wanted,missing")],
     );
-    let sc = spawn_sidecar(&mock, cfg, Kind::ConfigMap, "ns1").await;
+    let sc = spawn_sidecar(&mock, &cfg, Kind::ConfigMap, "ns1");
     assert_eq!(wait_file(&sc.dir, "w.json").await, "named");
     sc.cancel.cancel();
 }
@@ -604,7 +659,7 @@ async fn dead_stream_stays_dead_across_reconnects() {
     mock.upsert_cm("ns1", "cm-a", &[("a.json", "v1")]);
     let dir = tempfile::tempdir().unwrap();
     let cfg = cfg_for(dir.path(), &[]);
-    let sc = spawn_sidecar(&mock, cfg, Kind::ConfigMap, "ns1").await;
+    let sc = spawn_sidecar(&mock, &cfg, Kind::ConfigMap, "ns1");
     wait_file(&sc.dir, "a.json").await;
     assert!(
         wait_for(|| sc.health.probe().0 == 200).await,

@@ -1,3 +1,46 @@
+#![warn(
+    clippy::pedantic,
+    clippy::nursery,
+    clippy::cargo,
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing,
+    clippy::exit,
+    clippy::dbg_macro,
+    clippy::todo,
+    clippy::unimplemented,
+    clippy::unreachable,
+    clippy::undocumented_unsafe_blocks,
+    clippy::as_conversions
+)]
+#![allow(
+    // Transitive duplicate versions are outside our control.
+    clippy::multiple_crate_versions,
+    // Error behaviour is documented at module level, not via per-fn
+    // Errors sections; the public surface is consumed internally.
+    clippy::missing_errors_doc,
+    clippy::missing_panics_doc,
+    // Function length is governed by cognitive-complexity, not lines.
+    clippy::too_many_lines,
+    // Licence/keyword metadata is a maintainer decision, not a lint.
+    clippy::cargo_common_metadata,
+)]
+#![cfg_attr(
+    test,
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing,
+        clippy::unreachable,
+        clippy::disallowed_methods,
+        clippy::future_not_send,
+        clippy::assert_is_empty,
+        // Fake/test impls are async only because the real trait is.
+        clippy::unused_async_trait_impl,
+    )
+)]
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
@@ -22,6 +65,8 @@ const SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
 /// Bounded queue between streams and the single file reconciler.
 const EVENT_QUEUE: usize = 256;
 
+// Bootstrap is fail-fast by design; exit is the single deliberate lifecycle point.
+#[allow(clippy::expect_used, clippy::disallowed_methods)]
 fn main() {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -30,6 +75,9 @@ fn main() {
     std::process::exit(rt.block_on(run()));
 }
 
+// resolve_namespaces removes PodNamespace before the match below; the arm stays
+// an explicit panic rather than silently defaulting to no namespaces.
+#[allow(clippy::unreachable)]
 async fn run() -> i32 {
     let env: HashMap<String, String> = std::env::vars().collect();
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -87,18 +135,16 @@ async fn run() -> i32 {
 
     // Expected stream ids: one per (resource kind, namespace); ALL collapses
     // to a single cluster-wide stream per kind, like upstream.
+    // resolve_namespaces never returns PodNamespace — collapse to a list.
+    let ns_list: Vec<String> = match &namespaces {
+        Namespaces::All => vec!["ALL".to_string()],
+        Namespaces::List(list) => list.clone(),
+        Namespaces::PodNamespace => unreachable!("resolved above"),
+    };
     let mut expected: HashSet<(String, Duration)> = HashSet::new();
     for kind in &cfg.resources {
-        match &namespaces {
-            Namespaces::All => {
-                expected.insert((stream_id(*kind, "ALL"), heartbeat_for(&cfg, "ALL")));
-            }
-            Namespaces::List(list) => {
-                for ns in list {
-                    expected.insert((stream_id(*kind, ns), heartbeat_for(&cfg, ns)));
-                }
-            }
-            Namespaces::PodNamespace => unreachable!("resolved above"),
+        for ns in &ns_list {
+            expected.insert((stream_id(*kind, ns), heartbeat_for(&cfg, ns)));
         }
     }
     // Upstream 2.11.2: each stream's heartbeat interval is SLEEP_TIME for
@@ -115,12 +161,7 @@ async fn run() -> i32 {
 
     let once = cfg.method == Method::List;
     for kind in cfg.resources.clone() {
-        let ns_list: Vec<String> = match &namespaces {
-            Namespaces::All => vec!["ALL".to_string()],
-            Namespaces::List(list) => list.clone(),
-            Namespaces::PodNamespace => unreachable!(),
-        };
-        for ns in ns_list {
+        for ns in ns_list.clone() {
             let stream_ctx = watch::StreamCtx {
                 client: client.clone(),
                 cfg: cfg.clone(),
@@ -157,14 +198,7 @@ async fn run() -> i32 {
         tasks.spawn(async move { reconcile_loop(rx, rec, ctx).await });
     }
 
-    if cfg.method != Method::List {
-        if let Some(r) = reloader {
-            let (c, pause) = (cancel.clone(), cfg.error_throttle_sleep);
-            tasks.spawn(async move { r.run(c, pause).await });
-        }
-        let (state, port, c) = (health.clone(), cfg.health_port, cancel.clone());
-        tasks.spawn(async move { health::serve(state, port, c).await });
-    } else {
+    if cfg.method == Method::List {
         // LIST exits once every stream did a single pass and the queue drains.
         while tasks.join_next().await.is_some() {}
         // The reloader loop never ran — deliver the pending callback once.
@@ -174,12 +208,18 @@ async fn run() -> i32 {
         info!("list pass complete, exiting");
         return 0;
     }
+    if let Some(r) = reloader {
+        let (c, pause) = (cancel.clone(), cfg.error_throttle_sleep);
+        tasks.spawn(async move { r.run(c, pause).await });
+    }
+    let (state, port, c) = (health.clone(), cfg.health_port, cancel.clone());
+    tasks.spawn(async move { health::serve(state, port, c).await });
 
     // Upstream 2.11.2 semantics: any worker dying is fatal — the process exits
     // nonzero so the container runtime restarts it. No task should complete
     // before cancellation.
     tokio::select! {
-        _ = wait_for_shutdown() => {
+        () = wait_for_shutdown() => {
             info!("shutdown signal received, stopping");
         }
         res = tasks.join_next() => {
@@ -197,12 +237,11 @@ async fn run() -> i32 {
     let drain = tokio::time::timeout(SHUTDOWN_GRACE, async {
         while tasks.join_next().await.is_some() {}
     });
-    match drain.await {
-        Ok(()) => 0,
-        Err(_) => {
-            error!("tasks did not stop within grace period");
-            1
-        }
+    if drain.await.is_ok() {
+        0
+    } else {
+        error!("tasks did not stop within grace period");
+        1
     }
 }
 
@@ -213,7 +252,11 @@ async fn wait_for_shutdown() {
             tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).ok();
         tokio::select! {
             _ = tokio::signal::ctrl_c() => {}
-            _ = async { term.as_mut().unwrap().recv().await }, if term.is_some() => {}
+            () = async {
+                if let Some(t) = term.as_mut() {
+                    let _ = t.recv().await;
+                }
+            }, if term.is_some() => {}
         }
     }
     #[cfg(not(unix))]
@@ -223,8 +266,8 @@ async fn wait_for_shutdown() {
 }
 
 /// Upstream 2.11.2 `heartbeat_interval`: polling streams report in every
-/// SLEEP_TIME; watch streams get a heartbeat whenever the server closes the
-/// watch (WATCH_SERVER_TIMEOUT) or an event arrives.
+/// `SLEEP_TIME`; watch streams get a heartbeat whenever the server closes the
+/// watch (`WATCH_SERVER_TIMEOUT`) or an event arrives.
 fn heartbeat_for(cfg: &Config, ns: &str) -> Duration {
     match cfg.effective_method(ns) {
         Method::Sleep | Method::List => cfg.sleep_time,
@@ -268,7 +311,7 @@ async fn build_client(cfg: &Config) -> Result<Client, String> {
 
 /// `.url` key downloads — same shared HTTP session semantics as upstream:
 /// GET with the REQ_* auth/retry/timeout budget; response bodies are written
-/// verbatim (including 4xx); 5xx bodies are only written when ENABLE_5XX.
+/// verbatim (including 4xx); 5xx bodies are only written when `ENABLE_5XX`.
 struct HttpFetcher {
     http: reqwest::Client,
     settings: config::FetchSettings,
@@ -289,13 +332,11 @@ impl UrlFetcher for HttpFetcher {
             match req.send().await {
                 Ok(resp) => {
                     if resp.status().is_server_error() && !self.settings.enable_5xx {
-                        match tracker.failed(config::FailureKind::Status) {
-                            Some(d) => {
-                                delay = d;
-                                continue;
-                            }
-                            None => return Err(format!("{url} returned {}", resp.status())),
-                        }
+                        let Some(d) = tracker.failed(config::FailureKind::Status) else {
+                            return Err(format!("{url} returned {}", resp.status()));
+                        };
+                        delay = d;
+                        continue;
                     }
                     return resp
                         .bytes()
@@ -309,13 +350,10 @@ impl UrlFetcher for HttpFetcher {
                     } else {
                         config::FailureKind::Read
                     };
-                    match tracker.failed(kind) {
-                        Some(d) => {
-                            delay = d;
-                            continue;
-                        }
-                        None => return Err(e.to_string()),
-                    }
+                    let Some(d) = tracker.failed(kind) else {
+                        return Err(e.to_string());
+                    };
+                    delay = d;
                 }
             }
         }

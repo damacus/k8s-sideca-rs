@@ -1,9 +1,11 @@
-//! `/healthz` endpoint. Readiness: all watch streams completed their initial
-//! sync. Liveness: every stream contacted the Kubernetes API within the last
+//! `/healthz` endpoint with per-stream contact tracking.
+//!
+//! Readiness: all watch streams completed their initial sync. Liveness:
+//! every stream contacted the Kubernetes API within the last
 //! `K8S_CONTACT_THRESHOLD` and no stream task has died. Mirrors upstream
-//! semantics (per-stream contact tracking — the 2.5.0 supervisor loop
-//! unconditionally refreshed the shared timestamp every 5s, making the
-//! contact check ineffective; we track contact per stream instead).
+//! semantics (the 2.5.0 supervisor loop unconditionally refreshed the
+//! shared timestamp every 5s, making the contact check ineffective; we
+//! track contact per stream instead).
 
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -18,8 +20,8 @@ use tracing::{error, info};
 #[derive(Default)]
 struct Inner {
     /// stream id -> (last successful API contact, staleness threshold).
-    /// Threshold is 2× the stream's heartbeat interval (SLEEP_TIME for pollers,
-    /// WATCH_SERVER_TIMEOUT for watchers) — upstream 2.11.2 semantics.
+    /// Threshold is 2× the stream's heartbeat interval (`SLEEP_TIME` for pollers,
+    /// `WATCH_SERVER_TIMEOUT` for watchers) — upstream 2.11.2 semantics.
     contact: HashMap<String, (Instant, Duration)>,
     /// stream id -> alive.
     alive: HashMap<String, bool>,
@@ -33,6 +35,7 @@ pub struct HealthState {
 
 impl HealthState {
     /// `threshold_override` mirrors `K8S_CONTACT_THRESHOLD_SECONDS`.
+    #[must_use]
     pub fn new(threshold_override: Option<Duration>) -> Arc<Self> {
         Arc::new(Self {
             ready: AtomicBool::new(false),
@@ -48,7 +51,11 @@ impl HealthState {
     /// Register a stream; `heartbeat` is how often a healthy stream reports in.
     /// The staleness threshold is 2× that, matching upstream's derivation.
     pub fn register_stream(&self, stream: &str, heartbeat: Duration) {
-        let mut i = self.inner.lock().unwrap();
+        // A poisoned lock still holds usable state — recover the guard.
+        let mut i = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         i.alive.insert(stream.to_string(), true);
         i.contact
             .insert(stream.to_string(), (Instant::now(), 2 * heartbeat));
@@ -77,12 +84,15 @@ impl HealthState {
         }
     }
 
-    /// (status_code, body)
+    /// (`status_code`, body)
     pub fn probe(&self) -> (u16, &'static str) {
         if !self.ready.load(Ordering::SeqCst) {
             return (503, "NOT READY");
         }
-        let inner = self.inner.lock().unwrap();
+        let inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if inner.alive.values().any(|a| !*a) {
             return (503, "NOT LIVE (watcher thread died)");
         }
@@ -90,6 +100,7 @@ impl HealthState {
         let stale = inner.contact.values().any(|(t, threshold)| {
             now.duration_since(*t) > self.override_threshold.unwrap_or(*threshold)
         });
+        drop(inner);
         if stale {
             return (503, "NOT LIVE (K8s contact lost)");
         }
@@ -100,17 +111,14 @@ impl HealthState {
 /// Serves `/healthz` on `port`. Binds IPv6 dual-stack first, falls back to
 /// IPv4 (matches upstream's fix for clusters without IPv6).
 pub async fn serve(state: Arc<HealthState>, port: u16, cancel: CancellationToken) {
-    let listener = match bind(port) {
-        Some(l) => l,
-        None => {
-            // Upstream ran the health server on a daemon thread — a bind
-            // failure (e.g. two sidecars sharing a pod's network) killed
-            // only that thread, never file sync. Park until shutdown so a
-            // completed health task can't trip main's worker-death path.
-            error!(port, "health server failed to bind");
-            cancel.cancelled().await;
-            return;
-        }
+    let Some(listener) = bind(port) else {
+        // Upstream ran the health server on a daemon thread — a bind
+        // failure (e.g. two sidecars sharing a pod's network) killed
+        // only that thread, never file sync. Park until shutdown so a
+        // completed health task can't trip main's worker-death path.
+        error!(port, "health server failed to bind");
+        cancel.cancelled().await;
+        return;
     };
     info!(port, "health server listening");
 
@@ -149,11 +157,11 @@ pub async fn serve(state: Arc<HealthState>, port: u16, cancel: CancellationToken
 
     loop {
         tokio::select! {
-            _ = cancel.cancelled() => break,
+            () = cancel.cancelled() => break,
             Some(stream) = rx.recv() => {
                 let st = state.clone();
                 tokio::spawn(async move {
-                    tokio::task::spawn_blocking(move || handle(stream, st)).await.ok();
+                    tokio::task::spawn_blocking(move || handle(&stream, &st)).await.ok();
                 });
             }
         }
@@ -173,9 +181,9 @@ fn bind(port: u16) -> Option<TcpListener> {
 /// header line must not make the handler buffer unboundedly.
 const MAX_REQUEST_BYTES: u64 = 8 * 1024;
 
-fn handle(stream: std::net::TcpStream, state: Arc<HealthState>) {
+fn handle(stream: &std::net::TcpStream, state: &HealthState) {
     let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
-    let mut reader = BufReader::new((&stream).take(MAX_REQUEST_BYTES));
+    let mut reader = BufReader::new(stream.take(MAX_REQUEST_BYTES));
     let mut request_line = String::new();
     if reader.read_line(&mut request_line).is_err() || request_line.is_empty() {
         return;
@@ -190,7 +198,7 @@ fn handle(stream: std::net::TcpStream, state: Arc<HealthState>) {
     for line in reader.lines() {
         match line {
             Ok(l) if l.is_empty() => break,
-            Ok(_) => continue,
+            Ok(_) => {}
             Err(_) => return,
         }
     }
@@ -205,8 +213,9 @@ fn handle(stream: std::net::TcpStream, state: Arc<HealthState>) {
         404 => "Not Found",
         _ => "Service Unavailable",
     };
+    let mut out = stream;
     let _ = write!(
-        &mut &stream,
+        &mut out,
         "HTTP/1.1 {status} {reason}\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
     );

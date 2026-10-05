@@ -1,7 +1,7 @@
 //! Kubernetes streams -> bounded queue -> single file reconciler.
 //!
 //! `run_watcher` streams kube-rs `watcher` events; `run_lister` implements
-//! SLEEP/RESOURCE_NAME polling. Both normalise to `SyncEvent`s. The
+//! `SLEEP/RESOURCE_NAME` polling. Both normalise to `SyncEvent`s. The
 //! `reconcile_loop` applies upserts eagerly but buffers deletions inside an
 //! init window, committing them at `InitDone` — a failed partial relist can
 //! never delete files.
@@ -24,7 +24,7 @@ use crate::files::{Owner, Reconciler, UrlFetcher, plan_files, resolve_dest_folde
 use crate::health::HealthState;
 use crate::reload::Reloader;
 
-/// A ConfigMap or Secret flattened to what file reconciliation needs.
+/// A `ConfigMap` or Secret flattened to what file reconciliation needs.
 #[derive(Debug, Clone)]
 pub struct ResourceData {
     pub owner: Owner,
@@ -56,7 +56,7 @@ impl SyncEvent {
 impl From<&ConfigMap> for ResourceData {
     fn from(cm: &ConfigMap) -> Self {
         let meta = &cm.metadata;
-        ResourceData {
+        Self {
             owner: Owner {
                 kind: Kind::ConfigMap,
                 namespace: meta.namespace.clone().unwrap_or_default(),
@@ -79,7 +79,7 @@ impl From<&ConfigMap> for ResourceData {
 impl From<&Secret> for ResourceData {
     fn from(s: &Secret) -> Self {
         let meta = &s.metadata;
-        ResourceData {
+        Self {
             owner: Owner {
                 kind: Kind::Secret,
                 namespace: meta.namespace.clone().unwrap_or_default(),
@@ -99,6 +99,7 @@ impl From<&Secret> for ResourceData {
     }
 }
 
+#[must_use]
 pub fn stream_id(kind: Kind, namespace: &str) -> String {
     format!("{kind}/{namespace}")
 }
@@ -144,14 +145,14 @@ pub async fn run_watcher(ctx: StreamCtx, kind: Kind, namespace: String) {
         ctx.health.stream_dead(&id);
         match &result {
             Err(e) if stream_end_level(&result) == tracing::Level::ERROR => {
-                error!(stream = %id, error = %e, "watch stream ended; restarting")
+                error!(stream = %id, error = %e, "watch stream ended; restarting");
             }
             Err(e) => info!(stream = %id, reason = %e, "watch stream ended; restarting"),
             Ok(()) => info!(stream = %id, "watch stream ended; restarting"),
         }
         tokio::select! {
-            _ = ctx.cancel.cancelled() => return,
-            _ = tokio::time::sleep(ctx.cfg.error_throttle_sleep) => {}
+            () = ctx.cancel.cancelled() => return,
+            () = tokio::time::sleep(ctx.cfg.error_throttle_sleep) => {}
         }
     }
 }
@@ -193,8 +194,8 @@ async fn next_event<E>(
     cancel: &CancellationToken,
 ) -> NextEvent<E> {
     tokio::select! {
-        _ = cancel.cancelled() => NextEvent::Cancelled,
-        _ = tokio::time::sleep(idle) => NextEvent::Idle,
+        () = cancel.cancelled() => NextEvent::Cancelled,
+        () = tokio::time::sleep(idle) => NextEvent::Idle,
         e = next => NextEvent::Event(e),
     }
 }
@@ -213,15 +214,15 @@ enum WatchEnd {
 impl std::fmt::Display for WatchEnd {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            WatchEnd::Idle(d) => write!(f, "watch idle for {d:?}; reconnecting"),
-            WatchEnd::Other(e) => write!(f, "{e}"),
+            Self::Idle(d) => write!(f, "watch idle for {d:?}; reconnecting"),
+            Self::Other(e) => write!(f, "{e}"),
         }
     }
 }
 
 /// Real failures log at error; routine ends (clean close, idle reconnect)
 /// log at info — they are the reconnect cadence, not a fault.
-fn stream_end_level(result: &Result<(), WatchEnd>) -> tracing::Level {
+const fn stream_end_level(result: &Result<(), WatchEnd>) -> tracing::Level {
     match result {
         Err(WatchEnd::Other(_)) => tracing::Level::ERROR,
         _ => tracing::Level::INFO,
@@ -291,8 +292,8 @@ where
     }
 }
 
-/// SLEEP / RESOURCE_NAME mode: repeatedly list (or read named) resources.
-/// Emits InitStart/Upsert*/InitDone per pass so deletions commit atomically.
+/// SLEEP / `RESOURCE_NAME` mode: repeatedly list (or read named) resources.
+/// Emits InitStart/Upsert*/`InitDone` per pass so deletions commit atomically.
 pub async fn run_lister(ctx: StreamCtx, kind: Kind, namespace: String, once: bool) {
     let id = stream_id(kind, &namespace);
     loop {
@@ -320,12 +321,14 @@ pub async fn run_lister(ctx: StreamCtx, kind: Kind, namespace: String, once: boo
             return;
         }
         tokio::select! {
-            _ = ctx.cancel.cancelled() => return,
-            _ = tokio::time::sleep(ctx.cfg.sleep_time) => {}
+            () = ctx.cancel.cancelled() => return,
+            () = tokio::time::sleep(ctx.cfg.sleep_time) => {}
         }
     }
 }
 
+// Generic future — Send-ness is checked at the tokio::spawn call site.
+#[allow(clippy::future_not_send)]
 async fn list_once<T>(ctx: &StreamCtx, kind: Kind, namespace: &str, id: &str) -> Result<(), String>
 where
     T: kube::Resource<Scope = k8s_openapi::NamespaceResourceScope>
@@ -362,7 +365,7 @@ where
                     send_upsert(&ctx.tx, id, &item).await?;
                 }
                 Err(kube::Error::Api(e)) if e.code == 404 => {
-                    debug!(stream = %id, name, "named resource not found")
+                    debug!(stream = %id, name, "named resource not found");
                 }
                 Err(e) => return Err(e.to_string()),
             }
@@ -372,12 +375,13 @@ where
 }
 
 fn selector(cfg: &Config) -> String {
-    match &cfg.label_value {
-        Some(v) => format!("{}={v}", cfg.label),
-        None => cfg.label.clone(),
-    }
+    cfg.label_value
+        .as_ref()
+        .map_or_else(|| cfg.label.clone(), |v| format!("{}={v}", cfg.label))
 }
 
+// Generic future — Send-ness is checked at the tokio::spawn call site.
+#[allow(clippy::future_not_send)]
 async fn send_upsert<T>(tx: &mpsc::Sender<SyncEvent>, id: &str, item: &T) -> Result<(), String>
 where
     for<'a> ResourceData: From<&'a T>,
@@ -394,11 +398,11 @@ where
 struct StreamState {
     /// Owner keys this stream currently has on disk.
     known: BTreeSet<String>,
-    /// Between InitStart and InitDone — deletes are buffered, not applied.
+    /// Between `InitStart` and `InitDone` — deletes are buffered, not applied.
     in_init: bool,
     /// Owner keys seen during the current init window.
     init_seen: BTreeSet<String>,
-    /// Deletes received inside the current init window (committed at InitDone).
+    /// Deletes received inside the current init window (committed at `InitDone`).
     init_deletes: Vec<ResourceData>,
     /// Set once this stream finished its first init/list pass.
     synced: bool,
@@ -414,9 +418,13 @@ pub struct ReconcileCtx<F> {
     pub cancel: CancellationToken,
 }
 
-/// Single consumer for all stream events: reconciles files, drives reload
-/// generations, updates readiness. `expected_streams` must all complete an
-/// initial sync before `health` goes ready and `cleanup_stale` runs.
+/// Single consumer for all stream events.
+///
+/// Reconciles files, drives reload generations, updates readiness.
+/// `expected_streams` must all complete an initial sync before `health`
+/// goes ready and `cleanup_stale` runs.
+// Generic future — Send-ness is checked at the tokio::spawn call site.
+#[allow(clippy::future_not_send)]
 pub async fn reconcile_loop<F: UrlFetcher>(
     mut rx: mpsc::Receiver<SyncEvent>,
     mut rec: Reconciler,
@@ -437,7 +445,7 @@ pub async fn reconcile_loop<F: UrlFetcher>(
 
     loop {
         let event = tokio::select! {
-            _ = cancel.cancelled() => return,
+            () = cancel.cancelled() => return,
             e = rx.recv() => e,
         };
         let Some(event) = event else { return };
@@ -484,7 +492,7 @@ pub async fn reconcile_loop<F: UrlFetcher>(
                 owners.insert(data.owner.key(), data.owner.clone());
                 if st.in_init {
                     st.init_deletes.push(data);
-                } else if let Ok(true) = rec.remove(&data.owner) {
+                } else if matches!(rec.remove(&data.owner), Ok(true)) {
                     st.known.remove(&data.owner.key());
                     owners.remove(&data.owner.key());
                     if ready {
@@ -546,6 +554,8 @@ pub async fn reconcile_loop<F: UrlFetcher>(
     }
 }
 
+// Generic future — Send-ness is checked at the tokio::spawn call site.
+#[allow(clippy::future_not_send)]
 async fn apply_upsert<F: UrlFetcher>(
     rec: &mut Reconciler,
     cfg: &Config,
@@ -675,7 +685,7 @@ mod tests {
         );
     }
 
-    async fn harness(
+    fn harness(
         cfg: Arc<Config>,
         folder: &std::path::Path,
         streams: &[&str],
@@ -688,11 +698,14 @@ mod tests {
         }
         let cancel = CancellationToken::new();
         let ctx = ReconcileCtx {
-            cfg: cfg.clone(),
+            cfg,
             fetcher: NoFetch,
             reloader: None,
             health,
-            expected_streams: streams.iter().map(|s| s.to_string()).collect(),
+            expected_streams: streams
+                .iter()
+                .map(std::string::ToString::to_string)
+                .collect(),
             cancel: cancel.clone(),
         };
         let handle = tokio::spawn(reconcile_loop(rx, rec, ctx));
@@ -710,7 +723,7 @@ mod tests {
     async fn upsert_writes_file_and_init_done_marks_ready() {
         let tmp = TempDir::new().unwrap();
         let c = cfg(&[("LABEL", "x"), ("FOLDER", tmp.path().to_str().unwrap())]);
-        let (h, task) = harness(c, tmp.path(), &["configmap/ns"]).await;
+        let (h, task) = harness(c, tmp.path(), &["configmap/ns"]);
         h.tx.send(SyncEvent::InitStart {
             stream: "configmap/ns".into(),
         })
@@ -737,7 +750,7 @@ mod tests {
     async fn deletes_buffer_until_init_done() {
         let tmp = TempDir::new().unwrap();
         let c = cfg(&[("LABEL", "x"), ("FOLDER", tmp.path().to_str().unwrap())]);
-        let (h, task) = harness(c, tmp.path(), &["configmap/ns"]).await;
+        let (h, task) = harness(c, tmp.path(), &["configmap/ns"]);
         let s = "configmap/ns".to_string();
         // Initial sync with one file.
         for e in [
@@ -780,7 +793,7 @@ mod tests {
     async fn failed_partial_relist_preserves_files() {
         let tmp = TempDir::new().unwrap();
         let c = cfg(&[("LABEL", "x"), ("FOLDER", tmp.path().to_str().unwrap())]);
-        let (h, task) = harness(c, tmp.path(), &["configmap/ns"]).await;
+        let (h, task) = harness(c, tmp.path(), &["configmap/ns"]);
         let s = "configmap/ns".to_string();
         for e in [
             SyncEvent::InitStart { stream: s.clone() },
@@ -820,7 +833,7 @@ mod tests {
         // files must not be treated as vanished and deleted at InitDone.
         let tmp = TempDir::new().unwrap();
         let c = cfg(&[("LABEL", "x"), ("FOLDER", tmp.path().to_str().unwrap())]);
-        let (h, task) = harness(c, tmp.path(), &["configmap/ns"]).await;
+        let (h, task) = harness(c, tmp.path(), &["configmap/ns"]);
         let s = "configmap/ns".to_string();
         for e in [
             SyncEvent::InitStart { stream: s.clone() },
@@ -861,7 +874,7 @@ mod tests {
     async fn identical_content_no_reload() {
         let tmp = TempDir::new().unwrap();
         let c = cfg(&[("LABEL", "x"), ("FOLDER", tmp.path().to_str().unwrap())]);
-        let (h, task) = harness(c.clone(), tmp.path(), &["configmap/ns"]).await;
+        let (h, task) = harness(c.clone(), tmp.path(), &["configmap/ns"]);
         // no reloader wired here; assert via file mtime staying same is flaky —
         // instead assert apply() returns false on second identical upsert via
         // the reconciler directly (covered in files.rs tests). Here verify a

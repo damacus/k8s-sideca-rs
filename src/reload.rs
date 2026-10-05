@@ -1,7 +1,9 @@
-//! Reload callbacks: file changes publish a generation number; a single
-//! worker performs `REQ_URL` calls with upstream-style retries. A failed
-//! callback stays pending and is retried without needing another resource
-//! update (deliberate improvement over upstream, which drops it).
+//! Reload callbacks via a generation counter and one worker task.
+//!
+//! File changes publish a generation number; a single worker performs
+//! `REQ_URL` calls with upstream-style retries. A failed callback stays
+//! pending and is retried without needing another resource update
+//! (deliberate improvement over upstream, which drops it).
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -22,6 +24,7 @@ pub struct Reloader {
 }
 
 impl Reloader {
+    #[must_use]
     pub fn new(cfg: ReqConfig, http: reqwest::Client) -> Arc<Self> {
         Arc::new(Self {
             cfg,
@@ -77,16 +80,16 @@ impl Reloader {
                         // round so a dead endpoint doesn't hot-loop.
                         error!(url = %self.cfg.url, error = %e, "reload callback failed; will retry");
                         tokio::select! {
-                            _ = cancel.cancelled() => return,
-                            _ = tokio::time::sleep(retry_pause) => {}
+                            () = cancel.cancelled() => return,
+                            () = tokio::time::sleep(retry_pause) => {}
                         }
                         continue;
                     }
                 }
             }
             tokio::select! {
-                _ = cancel.cancelled() => return,
-                _ = self.notify.notified() => {}
+                () = cancel.cancelled() => return,
+                () = self.notify.notified() => {}
             }
         }
     }
@@ -102,14 +105,12 @@ impl Reloader {
                 Ok(resp) => {
                     let status = resp.status();
                     if status.is_server_error() && !self.cfg.common.enable_5xx {
-                        match tracker.failed(FailureKind::Status) {
-                            Some(d) => {
-                                delay = d;
-                                warn!(status = %status, "reload returned 5xx; retrying");
-                                continue;
-                            }
-                            None => return Err(format!("server returned {status}")),
-                        }
+                        let Some(d) = tracker.failed(FailureKind::Status) else {
+                            return Err(format!("server returned {status}"));
+                        };
+                        delay = d;
+                        warn!(status = %status, "reload returned 5xx; retrying");
+                        continue;
                     }
                     return Ok(());
                 }
@@ -119,13 +120,10 @@ impl Reloader {
                     } else {
                         FailureKind::Read
                     };
-                    match tracker.failed(kind) {
-                        Some(d) => {
-                            delay = d;
-                            continue;
-                        }
-                        None => return Err(e.to_string()),
-                    }
+                    let Some(d) = tracker.failed(kind) else {
+                        return Err(e.to_string());
+                    };
+                    delay = d;
                 }
             }
         }
@@ -183,7 +181,7 @@ fn encode_basic(user: &str, pass: &str, enc: BasicAuthEncoding) -> String {
         // latin1: each char maps to one byte; chars > 0xFF can't encode.
         BasicAuthEncoding::Latin1 => format!("{user}:{pass}")
             .chars()
-            .map(|c| u32::from(c).min(0xFF) as u8)
+            .map(|c| u8::try_from(u32::from(c).min(0xFF)).unwrap_or(u8::MAX))
             .collect(),
     };
     base64::engine::general_purpose::STANDARD.encode(raw)

@@ -1,0 +1,6 @@
+msrv = "1.99.0"
+cognitive-complexity-threshold = 30
+disallowed-methods = [
+    { path = "std::env::var", reason = "read config via the designated config loader" },
+    { path = "std::process::exit", reason = "fail-fast only at the deliberate lifecycle point" },
+]

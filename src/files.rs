@@ -21,6 +21,7 @@ pub struct Owner {
 }
 
 impl Owner {
+    #[must_use]
     pub fn key(&self) -> String {
         format!("{}/{}/{}", self.kind, self.namespace, self.name)
     }
@@ -35,8 +36,8 @@ impl serde::Serialize for Kind {
 impl<'de> serde::Deserialize<'de> for Kind {
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         match <String>::deserialize(d)?.as_str() {
-            "configmap" => Ok(Kind::ConfigMap),
-            "secret" => Ok(Kind::Secret),
+            "configmap" => Ok(Self::ConfigMap),
+            "secret" => Ok(Self::Secret),
             other => Err(serde::de::Error::custom(format!("unknown kind {other}"))),
         }
     }
@@ -62,15 +63,16 @@ pub struct PlannedFile {
     pub content: FileContent,
 }
 
-/// Filename prefix used when UNIQUE_FILENAMES is set — upstream format:
+/// Filename prefix used when `UNIQUE_FILENAMES` is set — upstream format:
 /// `namespace_{ns}.{kind}_{name}.{filename}`.
+#[must_use]
 pub fn unique_filename(filename: &str, namespace: &str, kind: Kind, name: &str) -> String {
     format!("namespace_{namespace}.{kind}_{name}.{filename}")
 }
 
 /// Resolve the destination folder for a resource, honouring the folder
 /// annotation (absolute paths used verbatim, relative resolved against
-/// `default_folder`) and FOLDER_PER_NAMESPACE.
+/// `default_folder`) and `FOLDER_PER_NAMESPACE`.
 ///
 /// Unlike upstream, a relative annotation that escapes `default_folder` is
 /// rejected — deliberate hardening, see SPEC/deliberate-differences.
@@ -132,6 +134,7 @@ fn normalize(p: &Path) -> PathBuf {
 
 /// Map one resource's data keys to planned files at `dest`.
 /// Keys ending `.url` produce fetch intents with the `.url` suffix stripped.
+#[must_use]
 pub fn plan_files(
     dest: &Path,
     owner: &Owner,
@@ -141,16 +144,18 @@ pub fn plan_files(
 ) -> Vec<PlannedFile> {
     let mut out = Vec::with_capacity(text_data.len() + binary_data.len());
     for (key, value) in text_data {
-        let (filename, content) = match key.strip_suffix(".url") {
-            Some(base) => (
-                base.to_string(),
-                FileContent::Url {
-                    url: value.clone(),
-                    binary: false,
-                },
-            ),
-            None => (key.clone(), FileContent::Bytes(value.clone().into_bytes())),
-        };
+        let (filename, content) = key.strip_suffix(".url").map_or_else(
+            || (key.clone(), FileContent::Bytes(value.clone().into_bytes())),
+            |base| {
+                (
+                    base.to_string(),
+                    FileContent::Url {
+                        url: value.clone(),
+                        binary: false,
+                    },
+                )
+            },
+        );
         let filename = if unique_filenames {
             unique_filename(&filename, &owner.namespace, owner.kind, &owner.name)
         } else {
@@ -162,18 +167,20 @@ pub fn plan_files(
         });
     }
     for (key, value) in binary_data {
-        let (filename, content) = match key.strip_suffix(".url") {
-            Some(base) => (
-                base.to_string(),
-                FileContent::Url {
-                    // binaryData values arrive already base64-decoded; the
-                    // decoded bytes are the URL string.
-                    url: String::from_utf8_lossy(value).to_string(),
-                    binary: true,
-                },
-            ),
-            None => (key.clone(), FileContent::Bytes(value.clone())),
-        };
+        let (filename, content) = key.strip_suffix(".url").map_or_else(
+            || (key.clone(), FileContent::Bytes(value.clone())),
+            |base| {
+                (
+                    base.to_string(),
+                    FileContent::Url {
+                        // binaryData values arrive already base64-decoded; the
+                        // decoded bytes are the URL string.
+                        url: String::from_utf8_lossy(value).to_string(),
+                        binary: true,
+                    },
+                )
+            },
+        );
         let filename = if unique_filenames {
             unique_filename(&filename, &owner.namespace, owner.kind, &owner.name)
         } else {
@@ -209,7 +216,7 @@ pub struct Manifest {
 /// upstream `_resources_object_map` + `_resources_dest_folder_map`).
 struct ResourceState {
     paths: BTreeSet<PathBuf>,
-    /// Latest resource_version seen — drives IGNORE_ALREADY_PROCESSED.
+    /// Latest `resource_version` seen — drives `IGNORE_ALREADY_PROCESSED`.
     resource_version: Option<String>,
 }
 
@@ -222,21 +229,24 @@ pub struct Reconciler {
 }
 
 impl Reconciler {
+    #[must_use]
     pub fn load(
         folder: &Path,
         default_file_mode: Option<u32>,
         ignore_already_processed: bool,
     ) -> Self {
         let manifest_path = folder.join(crate::config::MANIFEST_FILENAME);
-        let manifest = match std::fs::read(&manifest_path) {
-            Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_else(|e| {
-                // Fail closed: a corrupt manifest means "own nothing" rather
-                // than risking deleting unrelated files.
-                error!(error = %e, "manifest corrupt; starting with empty ownership set");
-                Manifest::default()
-            }),
-            Err(_) => Manifest::default(),
-        };
+        let manifest = std::fs::read(&manifest_path).map_or_else(
+            |_| Manifest::default(),
+            |bytes| {
+                serde_json::from_slice(&bytes).unwrap_or_else(|e| {
+                    // Fail closed: a corrupt manifest means "own nothing" rather
+                    // than risking deleting unrelated files.
+                    error!(error = %e, "manifest corrupt; starting with empty ownership set");
+                    Manifest::default()
+                })
+            },
+        );
         Self {
             manifest_path,
             manifest,
@@ -246,8 +256,9 @@ impl Reconciler {
         }
     }
 
-    /// `true` when this resource_version was already applied
-    /// (IGNORE_ALREADY_PROCESSED semantics — upstream dedupes on rv).
+    /// `true` when this `resource_version` was already applied
+    /// (`IGNORE_ALREADY_PROCESSED` semantics — upstream dedupes on rv).
+    #[must_use]
     pub fn already_processed(&self, owner: &Owner, resource_version: Option<&str>) -> bool {
         if !self.ignore_already_processed {
             return false;
@@ -263,6 +274,8 @@ impl Reconciler {
     /// data, annotation folder move).
     ///
     /// Returns `true` if any file on disk changed.
+    // Generic future — Send-ness is checked at the tokio::spawn call site.
+    #[allow(clippy::future_not_send)]
     pub async fn apply<F: UrlFetcher>(
         &mut self,
         owner: &Owner,
@@ -400,7 +413,7 @@ impl Reconciler {
     }
 
     #[cfg(test)]
-    fn manifest(&self) -> &Manifest {
+    const fn manifest(&self) -> &Manifest {
         &self.manifest
     }
 }
@@ -476,12 +489,12 @@ enum RemoveOutcome {
 
 impl RemoveOutcome {
     /// Whether the file contents on disk changed.
-    fn changed(&self) -> bool {
+    const fn changed(&self) -> bool {
         matches!(self, Self::Removed)
     }
 
     /// Whether the file is definitely gone — safe to drop ownership.
-    fn gone(&self) -> bool {
+    const fn gone(&self) -> bool {
         !matches!(self, Self::Failed)
     }
 }

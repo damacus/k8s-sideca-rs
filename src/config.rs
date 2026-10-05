@@ -2,6 +2,7 @@
 //! env-var surface (pinned to upstream 1.30.2 / 2.5.0).
 
 use std::collections::HashMap;
+use std::hash::BuildHasher;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -27,10 +28,11 @@ pub enum Kind {
 }
 
 impl Kind {
-    pub fn as_str(&self) -> &'static str {
+    #[must_use]
+    pub const fn as_str(&self) -> &'static str {
         match self {
-            Kind::ConfigMap => "configmap",
-            Kind::Secret => "secret",
+            Self::ConfigMap => "configmap",
+            Self::Secret => "secret",
         }
     }
 }
@@ -83,7 +85,7 @@ pub enum BasicAuthEncoding {
     Utf8,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Payload {
     Json(serde_json::Value),
     Text(String),
@@ -100,21 +102,24 @@ pub struct RetryConfig {
 impl RetryConfig {
     /// urllib3-style exponential backoff for retry `attempt` (1-based),
     /// capped at urllib3's `Retry.BACKOFF_MAX` (120s). The cap also bounds
-    /// the delay when the exponent overflows f64 (huge REQ_RETRY_TOTAL) —
+    /// the delay when the exponent overflows f64 (huge `REQ_RETRY_TOTAL`) —
     /// uncapped, `from_secs_f64(inf)` panics.
     // f64::max/min pass the non-NaN operand through — a hand-built
     // RetryConfig can carry a NaN factor (pub fields), and f64::clamp
     // would propagate NaN into from_secs_f64 where it panics.
     #[allow(clippy::manual_clamp)]
+    #[must_use]
     pub fn backoff_delay(&self, attempt: u32) -> Duration {
         const BACKOFF_MAX_SECS: f64 = 120.0;
-        let secs = self.backoff_factor * 2f64.powi(attempt.saturating_sub(1) as i32);
+        let secs = self.backoff_factor
+            * 2f64.powi(i32::try_from(attempt.saturating_sub(1)).unwrap_or(i32::MAX));
         Duration::from_secs_f64(secs.max(0.0).min(BACKOFF_MAX_SECS))
     }
 
     /// Per-request retry state — urllib3's connect/read budgets are separate
     /// counters that each also consume `total`.
-    pub fn tracker(&self) -> RetryTracker<'_> {
+    #[must_use]
+    pub const fn tracker(&self) -> RetryTracker<'_> {
         RetryTracker {
             cfg: self,
             retries_taken: 0,
@@ -144,7 +149,8 @@ pub struct RetryTracker<'a> {
 
 impl RetryTracker<'_> {
     /// Retries granted so far (the current attempt number).
-    pub fn retries_taken(&self) -> u32 {
+    #[must_use]
+    pub const fn retries_taken(&self) -> u32 {
         self.retries_taken
     }
 
@@ -202,6 +208,9 @@ pub enum LogFormat {
     Logfmt,
 }
 
+// Independent env-var flags — grouping them into enums would obscure the
+// 1:1 upstream env-var surface.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, PartialEq)]
 pub struct Config {
     pub label: String,
@@ -242,6 +251,7 @@ impl Config {
     /// Effective method for one concrete namespace ("ALL" is passed verbatim).
     /// Upstream: `SLEEP` mode, or `RESOURCE_NAME` set on a namespaced stream,
     /// polls via repeated list instead of watching.
+    #[must_use]
     pub fn effective_method(&self, namespace: &str) -> Method {
         if self.method == Method::Sleep || (namespace != "ALL" && !self.resource_names.is_empty()) {
             Method::Sleep
@@ -251,6 +261,7 @@ impl Config {
     }
 
     /// `RESOURCE_NAME` entries applicable to one (kind, namespace) stream.
+    #[must_use]
     pub fn resource_names_for(&self, kind: Kind, namespace: &str) -> Vec<String> {
         self.resource_names
             .iter()
@@ -265,6 +276,7 @@ impl Config {
     /// names `GET` on a cluster-scoped `Api::all` URL, which 404s for
     /// namespaced kinds. Upstream has the same limitation but says nothing;
     /// we warn at startup.
+    #[must_use]
     pub fn resource_name_ignored(&self) -> bool {
         self.namespaces == Namespaces::All && !self.resource_names.is_empty()
     }
@@ -274,38 +286,36 @@ fn parse_bool(value: Option<&String>) -> bool {
     value.is_some_and(|v| v.eq_ignore_ascii_case("true"))
 }
 
-fn parse_u64(
-    env: &HashMap<String, String>,
+fn parse_u64<S: BuildHasher>(
+    env: &HashMap<String, String, S>,
     var: &'static str,
     default: u64,
 ) -> Result<u64, ConfigError> {
-    match env.get(var) {
-        None => Ok(default),
-        Some(v) => v.parse().map_err(|_| ConfigError::Invalid {
+    env.get(var).map_or(Ok(default), |v| {
+        v.parse().map_err(|_| ConfigError::Invalid {
             var,
             value: v.clone(),
-        }),
-    }
+        })
+    })
 }
 
-fn parse_f64(
-    env: &HashMap<String, String>,
+fn parse_f64<S: BuildHasher>(
+    env: &HashMap<String, String, S>,
     var: &'static str,
     default: f64,
 ) -> Result<f64, ConfigError> {
-    match env.get(var) {
-        None => Ok(default),
-        Some(v) => v.parse().map_err(|_| ConfigError::Invalid {
+    env.get(var).map_or(Ok(default), |v| {
+        v.parse().map_err(|_| ConfigError::Invalid {
             var,
             value: v.clone(),
-        }),
-    }
+        })
+    })
 }
 
 /// A positive, finite f64 — negative/NaN/inf values would panic inside
 /// `Duration::from_secs_f64` or produce nonsensical backoff math.
-fn parse_f64_positive(
-    env: &HashMap<String, String>,
+fn parse_f64_positive<S: BuildHasher>(
+    env: &HashMap<String, String, S>,
     var: &'static str,
     default: f64,
 ) -> Result<f64, ConfigError> {
@@ -320,8 +330,8 @@ fn parse_f64_positive(
 }
 
 /// A finite, non-negative f64 (backoff factor — 0 disables the delay).
-fn parse_f64_nonnegative(
-    env: &HashMap<String, String>,
+fn parse_f64_nonnegative<S: BuildHasher>(
+    env: &HashMap<String, String, S>,
     var: &'static str,
     default: f64,
 ) -> Result<f64, ConfigError> {
@@ -339,8 +349,8 @@ fn parse_f64_nonnegative(
 /// heartbeat. `0` is not "no timeout": the server closes the watch
 /// immediately (hot reconnect loop) and a zero client read-timeout fails
 /// every request. Above `u32::MAX` silently truncates. Bound both.
-fn parse_watch_timeout(
-    env: &HashMap<String, String>,
+fn parse_watch_timeout<S: BuildHasher>(
+    env: &HashMap<String, String, S>,
     var: &'static str,
     default: u64,
 ) -> Result<u64, ConfigError> {
@@ -354,18 +364,17 @@ fn parse_watch_timeout(
     Ok(v)
 }
 
-fn parse_u32(
-    env: &HashMap<String, String>,
+fn parse_u32<S: BuildHasher>(
+    env: &HashMap<String, String, S>,
     var: &'static str,
     default: u32,
 ) -> Result<u32, ConfigError> {
-    match env.get(var) {
-        None => Ok(default),
-        Some(v) => v.parse().map_err(|_| ConfigError::Invalid {
+    env.get(var).map_or(Ok(default), |v| {
+        v.parse().map_err(|_| ConfigError::Invalid {
             var,
             value: v.clone(),
-        }),
-    }
+        })
+    })
 }
 
 fn parse_resource_name(value: &str) -> Result<ResourceNameSelector, ConfigError> {
@@ -418,7 +427,9 @@ fn parse_resource_name(value: &str) -> Result<ResourceNameSelector, ConfigError>
     }
 }
 
-fn parse_file_mode(env: &HashMap<String, String>) -> Result<Option<u32>, ConfigError> {
+fn parse_file_mode<S: BuildHasher>(
+    env: &HashMap<String, String, S>,
+) -> Result<Option<u32>, ConfigError> {
     match env.get("DEFAULT_FILE_MODE") {
         None => Ok(None),
         Some(v) => {
@@ -439,21 +450,18 @@ fn parse_file_mode(env: &HashMap<String, String>) -> Result<Option<u32>, ConfigE
 }
 
 fn parse_payload(raw: &str) -> Payload {
-    match serde_json::from_str(raw) {
-        Ok(v) => Payload::Json(v),
-        Err(_) => Payload::Text(raw.to_string()),
-    }
+    serde_json::from_str(raw).map_or_else(|_| Payload::Text(raw.to_string()), Payload::Json)
 }
 
 fn parse_args(args: &[String]) -> HashMap<String, String> {
     // Upstream uses argparse with --req-username-file / --req-password-file.
     let mut out = HashMap::new();
     let mut i = 0;
-    while i < args.len() {
-        if let Some((key, inline)) = args[i].split_once('=') {
+    while let Some(arg) = args.get(i) {
+        if let Some((key, inline)) = arg.split_once('=') {
             out.insert(key.to_string(), inline.to_string());
-        } else if i + 1 < args.len() {
-            out.insert(args[i].clone(), args[i + 1].clone());
+        } else if let Some(next) = args.get(i + 1) {
+            out.insert(arg.clone(), next.clone());
             i += 1;
         }
         i += 1;
@@ -462,7 +470,10 @@ fn parse_args(args: &[String]) -> HashMap<String, String> {
 }
 
 /// Build a Config from an environment map and CLI args (injectable for tests).
-pub fn load(env: &HashMap<String, String>, args: &[String]) -> Result<Config, ConfigError> {
+pub fn load<S: BuildHasher>(
+    env: &HashMap<String, String, S>,
+    args: &[String],
+) -> Result<Config, ConfigError> {
     // Deliberate unsupported features — fail loudly rather than silently
     // dropping behaviour a deployment relies on.
     if env.get("SCRIPT").is_some_and(|v| !v.is_empty()) {
@@ -497,11 +508,7 @@ pub fn load(env: &HashMap<String, String>, args: &[String]) -> Result<Config, Co
         Some(v) => Namespaces::List(v.split(',').map(|s| s.trim().to_string()).collect()),
     };
 
-    let resources = match env
-        .get("RESOURCE")
-        .map(String::as_str)
-        .unwrap_or("configmap")
-    {
+    let resources = match env.get("RESOURCE").map_or("configmap", String::as_str) {
         "configmap" => vec![Kind::ConfigMap],
         "secret" => vec![Kind::Secret],
         // Upstream iterates ("secret", "configmap") for `both`.
@@ -542,8 +549,8 @@ pub fn load(env: &HashMap<String, String>, args: &[String]) -> Result<Config, Co
         .map(PathBuf::from);
 
     let basic_auth_encoding = match env.get("REQ_BASIC_AUTH_ENCODING").map(String::as_str) {
-        None | Some("latin1") | Some("latin-1") | Some("iso-8859-1") => BasicAuthEncoding::Latin1,
-        Some("utf-8") | Some("utf8") => BasicAuthEncoding::Utf8,
+        None | Some("latin1" | "latin-1" | "iso-8859-1") => BasicAuthEncoding::Latin1,
+        Some("utf-8" | "utf8") => BasicAuthEncoding::Utf8,
         Some(other) => {
             return Err(ConfigError::Invalid {
                 var: "REQ_BASIC_AUTH_ENCODING",
@@ -642,14 +649,19 @@ pub fn load(env: &HashMap<String, String>, args: &[String]) -> Result<Config, Co
         // u16 via u64 parse: reject 0 (binds an ephemeral port — probes
         // would never find it) and >65535 (silently truncated before).
         health_port: {
-            let p = parse_u64(env, "HEALTH_PORT", 8080)?;
-            if p == 0 || p > u64::from(u16::MAX) {
+            let p: u16 = env.get("HEALTH_PORT").map_or(Ok(8080), |v| {
+                v.parse().map_err(|_| ConfigError::Invalid {
+                    var: "HEALTH_PORT",
+                    value: v.clone(),
+                })
+            })?;
+            if p == 0 {
                 return Err(ConfigError::Invalid {
                     var: "HEALTH_PORT",
                     value: env.get("HEALTH_PORT").cloned().unwrap_or_default(),
                 });
             }
-            p as u16
+            p
         },
         log_level: env
             .get("LOG_LEVEL")
