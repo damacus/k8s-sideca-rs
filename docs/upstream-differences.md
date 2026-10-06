@@ -9,7 +9,13 @@ Deliberate behaviour changes relative to `kiwigrid/k8s-sidecar` `2.11.2`.
   unrelated files. Upstream leaves stale files across restarts.
   The manifest lives in a private subdirectory inside `FOLDER`, the only
   guaranteed-writable path. Loki skips this directory when loading rules.
-  Old tracking files are migrated with their ownership preserved.
+  Both old tracking files are merged during migration; the canonical
+  `.k8s-sideca-rs.manifest.json` spelling wins conflicting ownership entries.
+  A successfully saved current manifest takes precedence on later restarts.
+  The replacement file and directory entries are synced before old files are
+  removed. Cleanup failures are logged and retried without suppressing reloads.
+  The `.k8s-sideca-rs` state directory is reserved: conflicting output paths
+  are rejected before any resource files are written, preserving existing data.
   Consumers scanning `FOLDER` must ignore the private state subdirectory.
   Loki's local ruler parses every file directly inside a tenant directory;
   a dot-prefixed JSON file there prevents rule loading.
