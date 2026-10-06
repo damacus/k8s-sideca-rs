@@ -236,7 +236,14 @@ impl Reconciler {
         ignore_already_processed: bool,
     ) -> Self {
         let manifest_path = folder.join(crate::config::MANIFEST_FILENAME);
-        let manifest = std::fs::read(&manifest_path).map_or_else(
+        let bytes = std::fs::read(&manifest_path).or_else(|error| {
+            if error.kind() != io::ErrorKind::NotFound {
+                return Err(error);
+            }
+            std::fs::read(folder.join(".k8s-sidecar-rs.manifest.json"))
+                .or_else(|_| std::fs::read(folder.join(".k8s-sideca-rs.manifest.json")))
+        });
+        let manifest = bytes.map_or_else(
             |_| Manifest::default(),
             |bytes| {
                 serde_json::from_slice(&bytes).unwrap_or_else(|e| {
@@ -409,7 +416,24 @@ impl Reconciler {
         }
         let data = serde_json::to_vec(&self.manifest)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        atomic_write(&self.manifest_path, &data, None)
+        atomic_write(&self.manifest_path, &data, None)?;
+        // Only discard old tracking files after the replacement is durable.
+        let folder = self
+            .manifest_path
+            .parent()
+            .and_then(Path::parent)
+            .ok_or_else(|| io::Error::other("invalid manifest path"))?;
+        for name in [
+            ".k8s-sidecar-rs.manifest.json",
+            ".k8s-sideca-rs.manifest.json",
+        ] {
+            match std::fs::remove_file(folder.join(name)) {
+                Ok(()) => (),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => (),
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(())
     }
 
     #[cfg(test)]
@@ -548,6 +572,32 @@ mod tests {
             .iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect()
+    }
+
+    #[test]
+    fn ownership_state_is_outside_rule_files() {
+        let tmp = TempDir::new().unwrap();
+        let rec = Reconciler::load(tmp.path(), None, false);
+        rec.persist_manifest().unwrap();
+        assert_ne!(rec.manifest_path.parent().unwrap(), tmp.path());
+        assert!(rec.manifest_path.is_file());
+    }
+
+    #[test]
+    fn migrates_legacy_manifest_without_losing_ownership() {
+        let tmp = TempDir::new().unwrap();
+        let legacy = tmp.path().join(".k8s-sidecar-rs.manifest.json");
+        let mut manifest = Manifest::default();
+        manifest
+            .files
+            .insert(tmp.path().join("rules.yaml"), owner());
+        std::fs::write(&legacy, serde_json::to_vec(&manifest).unwrap()).unwrap();
+        let rec = Reconciler::load(tmp.path(), None, false);
+        assert_eq!(rec.manifest.files.len(), 1);
+        rec.persist_manifest().unwrap();
+        assert!(!legacy.exists());
+        let restarted = Reconciler::load(tmp.path(), None, false);
+        assert_eq!(restarted.manifest.files.len(), 1);
     }
 
     #[test]
@@ -842,6 +892,7 @@ mod tests {
     async fn corrupt_manifest_fails_closed() {
         let tmp = TempDir::new().unwrap();
         let folder = tmp.path().to_path_buf();
+        std::fs::create_dir_all(folder.join(".k8s-sidecar-rs")).unwrap();
         std::fs::write(folder.join(crate::config::MANIFEST_FILENAME), b"{not json").unwrap();
         let mut rec = Reconciler::load(&folder, None, false);
         assert!(rec.manifest().files.is_empty());

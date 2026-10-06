@@ -9,7 +9,7 @@ use std::time::Duration;
 use thiserror::Error;
 
 pub const DEFAULT_FOLDER_ANNOTATION: &str = "k8s-sidecar-target-directory";
-pub const MANIFEST_FILENAME: &str = ".k8s-sideca-rs.manifest.json";
+pub const MANIFEST_FILENAME: &str = ".k8s-sidecar-rs/manifest.json";
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum ConfigError {

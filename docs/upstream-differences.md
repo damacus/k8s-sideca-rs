@@ -4,13 +4,15 @@ Deliberate behaviour changes relative to `kiwigrid/k8s-sidecar` `2.11.2`.
 
 - **Atomic writes** — files are written to a temp path then renamed; upstream
   writes in place.
-- **Ownership manifest** — `.k8s-sideca-rs.manifest.json` tracks which files
+- **Ownership manifest** — `.k8s-sidecar-rs/manifest.json` tracks which files
   this sidecar owns, so a restart cleans owned stale files without touching
   unrelated files. Upstream leaves stale files across restarts.
-  The manifest lives inside `FOLDER` — the only guaranteed-writable path.
-  Consumers scanning `FOLDER` must tolerate a dot-prefixed JSON file
-  (Grafana's file provisioner skips dotfiles; Loki's `*.yaml` glob is
-  unaffected).
+  The manifest lives in a private subdirectory inside `FOLDER`, the only
+  guaranteed-writable path. Loki skips this directory when loading rules.
+  Old tracking files are migrated with their ownership preserved.
+  Consumers scanning `FOLDER` must ignore the private state subdirectory.
+  Loki's local ruler parses every file directly inside a tenant directory;
+  a dot-prefixed JSON file there prevents rule loading.
 - **Path traversal** — a relative `FOLDER_ANNOTATION` that escapes `FOLDER`
   is rejected; upstream allows it.
 
