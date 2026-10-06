@@ -4,7 +4,7 @@ Deliberate behaviour changes relative to `kiwigrid/k8s-sidecar` `2.11.2`.
 
 - **Atomic writes** — files are written to a temp path then renamed; upstream
   writes in place.
-- **Ownership manifest** — `.k8s-sidecar-rs/manifest.json` tracks which files
+- **Ownership manifest** — `.k8s-sideca-rs/manifest.json` tracks which files
   this sidecar owns, so a restart cleans owned stale files without touching
   unrelated files. Upstream leaves stale files across restarts.
   The manifest lives in a private subdirectory inside `FOLDER`, the only
