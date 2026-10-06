@@ -236,17 +236,35 @@ impl Reconciler {
         ignore_already_processed: bool,
     ) -> Self {
         let manifest_path = folder.join(crate::config::MANIFEST_FILENAME);
-        let manifest = std::fs::read(&manifest_path).map_or_else(
-            |_| Manifest::default(),
-            |bytes| {
-                serde_json::from_slice(&bytes).unwrap_or_else(|e| {
-                    // Fail closed: a corrupt manifest means "own nothing" rather
-                    // than risking deleting unrelated files.
-                    error!(error = %e, "manifest corrupt; starting with empty ownership set");
-                    Manifest::default()
-                })
-            },
-        );
+        let decode = |bytes: &[u8]| {
+            serde_json::from_slice::<Manifest>(bytes).unwrap_or_else(|e| {
+                // A corrupt manifest owns nothing; never delete foreign files.
+                error!(error = %e, "manifest corrupt; starting with empty ownership set");
+                Manifest::default()
+            })
+        };
+        let manifest = match std::fs::read(&manifest_path) {
+            Ok(bytes) => decode(&bytes),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                let mut merged = Manifest::default();
+                // Merge both spellings; the canonical spelling wins conflicts.
+                for name in [
+                    ".k8s-sidecar-rs.manifest.json",
+                    ".k8s-sideca-rs.manifest.json",
+                ] {
+                    match std::fs::read(folder.join(name)) {
+                        Ok(bytes) => merged.files.extend(decode(&bytes).files),
+                        Err(error) if error.kind() == io::ErrorKind::NotFound => (),
+                        Err(error) => warn!(error = %error, name, "cannot read legacy manifest"),
+                    }
+                }
+                merged
+            }
+            Err(error) => {
+                error!(error = %error, "cannot read manifest; starting with empty ownership set");
+                Manifest::default()
+            }
+        };
         Self {
             manifest_path,
             manifest,
@@ -283,6 +301,23 @@ impl Reconciler {
         resource_version: Option<String>,
         fetcher: &F,
     ) -> io::Result<bool> {
+        let state_dir = normalize(
+            self.manifest_path
+                .parent()
+                .ok_or_else(|| io::Error::other("invalid manifest path"))?,
+        );
+        if planned
+            .iter()
+            .any(|file| normalize(&file.path).starts_with(&state_dir))
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "output path collides with reserved state directory {}",
+                    state_dir.display()
+                ),
+            ));
+        }
         let mut changed = false;
         let mut new_paths = BTreeSet::new();
         let mut written = BTreeSet::new();
@@ -409,7 +444,32 @@ impl Reconciler {
         }
         let data = serde_json::to_vec(&self.manifest)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        atomic_write(&self.manifest_path, &data, None)
+        atomic_write(&self.manifest_path, &data, None)?;
+        // Sync the replacement entry and its directory before deleting old state.
+        let folder = self
+            .manifest_path
+            .parent()
+            .and_then(Path::parent)
+            .ok_or_else(|| io::Error::other("invalid manifest path"))?;
+        sync_dir(
+            self.manifest_path
+                .parent()
+                .ok_or_else(|| io::Error::other("invalid manifest path"))?,
+        )?;
+        sync_dir(folder)?;
+        for name in [
+            ".k8s-sidecar-rs.manifest.json",
+            ".k8s-sideca-rs.manifest.json",
+        ] {
+            match std::fs::remove_file(folder.join(name)) {
+                Ok(()) => (),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => (),
+                Err(error) => {
+                    warn!(error = %error, name, "cannot remove legacy manifest; will retry");
+                }
+            }
+        }
+        Ok(())
     }
 
     #[cfg(test)]
@@ -548,6 +608,152 @@ mod tests {
             .iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect()
+    }
+
+    #[test]
+    fn ownership_state_is_outside_rule_files() {
+        let tmp = TempDir::new().unwrap();
+        let rec = Reconciler::load(tmp.path(), None, false);
+        rec.persist_manifest().unwrap();
+        assert_eq!(
+            rec.manifest_path,
+            tmp.path().join(".k8s-sideca-rs/manifest.json")
+        );
+        assert_ne!(rec.manifest_path.parent().unwrap(), tmp.path());
+        assert!(rec.manifest_path.is_file());
+    }
+
+    #[test]
+    fn migrates_legacy_manifest_without_losing_ownership() {
+        for name in [
+            ".k8s-sideca-rs.manifest.json",
+            ".k8s-sidecar-rs.manifest.json",
+        ] {
+            let tmp = TempDir::new().unwrap();
+            let legacy = tmp.path().join(name);
+            let mut manifest = Manifest::default();
+            manifest
+                .files
+                .insert(tmp.path().join("rules.yaml"), owner());
+            std::fs::write(&legacy, serde_json::to_vec(&manifest).unwrap()).unwrap();
+            let rec = Reconciler::load(tmp.path(), None, false);
+            assert_eq!(rec.manifest.files.len(), 1);
+            rec.persist_manifest().unwrap();
+            assert!(!legacy.exists());
+            assert!(tmp.path().join(".k8s-sideca-rs/manifest.json").is_file());
+            std::fs::write(tmp.path().join("rules.yaml"), "rule").unwrap();
+            let mut restarted = Reconciler::load(tmp.path(), None, false);
+            assert_eq!(restarted.manifest.files.len(), 1);
+            restarted.cleanup_stale(&BTreeSet::new()).unwrap();
+            assert!(!tmp.path().join("rules.yaml").exists());
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_cleanup_failure_does_not_suppress_changed_result() {
+        let tmp = TempDir::new().unwrap();
+        // A directory deterministically makes unlink fail, even as root.
+        std::fs::create_dir(tmp.path().join(".k8s-sideca-rs.manifest.json")).unwrap();
+        let mut rec = Reconciler::load(tmp.path(), None, false);
+        let planned = plan_files(
+            tmp.path(),
+            &owner(),
+            &texts(&[("rule.yaml", "one")]),
+            &BTreeMap::new(),
+            false,
+        );
+        assert!(rec.apply(&owner(), planned, None, &NoFetch).await.unwrap());
+        assert!(rec.manifest_path.is_file());
+        let planned = plan_files(
+            tmp.path(),
+            &owner(),
+            &texts(&[("rule.yaml", "two")]),
+            &BTreeMap::new(),
+            false,
+        );
+        assert!(rec.apply(&owner(), planned, None, &NoFetch).await.unwrap());
+    }
+
+    #[test]
+    fn legacy_manifests_merge_and_cleanup_after_restart() {
+        let tmp = TempDir::new().unwrap();
+        let alternate_owner = Owner {
+            name: "other".into(),
+            ..owner()
+        };
+        for (name, file, collision_owner) in [
+            (".k8s-sidecar-rs.manifest.json", "a.yaml", alternate_owner),
+            (".k8s-sideca-rs.manifest.json", "b.yaml", owner()),
+        ] {
+            let mut manifest = Manifest::default();
+            manifest.files.insert(tmp.path().join(file), owner());
+            manifest
+                .files
+                .insert(tmp.path().join("shared.yaml"), collision_owner);
+            std::fs::write(
+                tmp.path().join(name),
+                serde_json::to_vec(&manifest).unwrap(),
+            )
+            .unwrap();
+            std::fs::write(tmp.path().join(file), "rule").unwrap();
+        }
+        std::fs::write(tmp.path().join("shared.yaml"), "rule").unwrap();
+        std::fs::write(tmp.path().join("unrelated.yaml"), "keep").unwrap();
+        let rec = Reconciler::load(tmp.path(), None, false);
+        assert_eq!(rec.manifest.files.len(), 3);
+        assert_eq!(rec.manifest.files[&tmp.path().join("shared.yaml")], owner());
+        rec.persist_manifest().unwrap();
+        let mut restarted = Reconciler::load(tmp.path(), None, false);
+        restarted.cleanup_stale(&BTreeSet::new()).unwrap();
+        for file in ["a.yaml", "b.yaml", "shared.yaml"] {
+            assert!(!tmp.path().join(file).exists());
+        }
+        assert!(tmp.path().join("unrelated.yaml").exists());
+    }
+
+    #[tokio::test]
+    async fn reserved_state_path_is_rejected_before_any_writes() {
+        for state_first in [false, true] {
+            let tmp = TempDir::new().unwrap();
+            let mut rec = Reconciler::load(tmp.path(), None, false);
+            if state_first {
+                rec.persist_manifest().unwrap();
+            } else {
+                std::fs::write(tmp.path().join(".k8s-sideca-rs"), "foreign").unwrap();
+            }
+            let planned = plan_files(
+                tmp.path(),
+                &owner(),
+                &texts(&[(".k8s-sideca-rs", "overwrite"), ("other.yaml", "rule")]),
+                &BTreeMap::new(),
+                false,
+            );
+            let error = rec
+                .apply(&owner(), planned, None, &NoFetch)
+                .await
+                .unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+            assert!(!tmp.path().join("other.yaml").exists());
+            if state_first {
+                assert!(rec.manifest_path.is_file());
+            } else {
+                assert_eq!(
+                    std::fs::read_to_string(tmp.path().join(".k8s-sideca-rs")).unwrap(),
+                    "foreign"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn replacement_failure_preserves_legacy_manifest() {
+        let tmp = TempDir::new().unwrap();
+        let legacy = tmp.path().join(".k8s-sideca-rs.manifest.json");
+        std::fs::write(&legacy, b"{}").unwrap();
+        std::fs::write(tmp.path().join(".k8s-sideca-rs"), b"foreign").unwrap();
+        let rec = Reconciler::load(tmp.path(), None, false);
+        assert!(rec.persist_manifest().is_err());
+        assert_eq!(std::fs::read(&legacy).unwrap(), b"{}");
     }
 
     #[test]
@@ -842,6 +1048,7 @@ mod tests {
     async fn corrupt_manifest_fails_closed() {
         let tmp = TempDir::new().unwrap();
         let folder = tmp.path().to_path_buf();
+        std::fs::create_dir_all(folder.join(".k8s-sideca-rs")).unwrap();
         std::fs::write(folder.join(crate::config::MANIFEST_FILENAME), b"{not json").unwrap();
         let mut rec = Reconciler::load(&folder, None, false);
         assert!(rec.manifest().files.is_empty());
