@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.5](https://github.com/damacus/k8s-sideca-rs/compare/v0.2.4...v0.2.5) (2026-10-06)
+
+
+### Bug Fixes
+
+* keep watcher state outside Loki rules ([#45](https://github.com/damacus/k8s-sideca-rs/issues/45)) ([62a5dc1](https://github.com/damacus/k8s-sideca-rs/commit/62a5dc18f7d4b886a0c033b9ef67e9547e573057))
+
 ## [0.2.4](https://github.com/damacus/k8s-sideca-rs/compare/v0.2.3...v0.2.4) (2026-10-04)
 
 
