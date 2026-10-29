@@ -6,13 +6,20 @@ name: beta image
 # `sha-<sha>` (exact). Beta builds skip SBOM/provenance; they are not release
 # artifacts.
 #
-# `workflow_dispatch` allows ad-hoc beta builds of any ref (e.g. a feature
-# branch under test).
+# release-please PRs are opened with GITHUB_TOKEN, whose events cannot trigger
+# other workflows — so `pull_request` alone never fires for them. The
+# `workflow_run` trigger resolves the open release-please PR after each
+# release-please run instead. `pull_request` still covers preview branches
+# opened by users/apps, and `workflow_dispatch` allows ad-hoc builds of any ref.
 
 on:
   pull_request:
     branches: [main]
     types: [opened, synchronize, reopened]
+  workflow_run:
+    workflows: [release-please]
+    types: [completed]
+    branches: [main]
   workflow_dispatch:
     inputs:
       ref:
@@ -23,6 +30,7 @@ on:
 permissions:
   contents: read
   packages: write
+  pull-requests: read
 
 concurrency:
   group: beta-image-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
@@ -36,24 +44,59 @@ jobs:
     runs-on: ubuntu-latest
     if: >-
       github.event_name == 'workflow_dispatch' ||
-      startsWith(github.head_ref, 'release-please--')
+      (github.event_name == 'pull_request' && startsWith(github.head_ref, 'release-please--')) ||
+      (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success')
     outputs:
+      sha: ${{ steps.target.outputs.sha }}
       tags: ${{ steps.tags.outputs.tags }}
       arch_tag: ${{ steps.tags.outputs.arch_tag }}
     steps:
+      - name: Resolve target SHA
+        id: target
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          EVENT: ${{ github.event_name }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha || '' }}
+          DISPATCH_REF: ${{ inputs.ref || '' }}
+          WORKFLOW_SHA: ${{ github.sha }}
+        run: |
+          case "$EVENT" in
+            pull_request)
+              sha="$PR_HEAD"
+              ;;
+            workflow_run)
+              sha=$(gh pr list --repo "$GITHUB_REPOSITORY" --state open \
+                --json headRefName,headRefOid \
+                --jq '[.[] | select(.headRefName | startswith("release-please--"))][0].headRefOid // empty')
+              ;;
+            *)
+              ref="${DISPATCH_REF:-$WORKFLOW_SHA}"
+              sha=$(gh api "repos/$GITHUB_REPOSITORY/commits/$ref" --jq .sha)
+              ;;
+          esac
+          if [[ -n "$sha" ]]; then
+            echo "target: $sha"
+          else
+            echo "no open release-please PR; nothing to build"
+          fi
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+
       - uses: actions/checkout@v7
+        if: steps.target.outputs.sha != ''
         with:
-          ref: ${{ github.event.pull_request.head.sha || inputs.ref || github.sha }}
+          ref: ${{ steps.target.outputs.sha }}
           persist-credentials: false
+
       - name: Resolve beta tags
         id: tags
+        if: steps.target.outputs.sha != ''
         env:
-          HEAD_REF: ${{ github.head_ref || '' }}
+          EVENT: ${{ github.event_name }}
         run: |
           short=$(git rev-parse --short=8 HEAD)
           echo "arch_tag=${IMAGE}:sha-${short}" >> "$GITHUB_OUTPUT"
           tags="beta sha-${short}"
-          if [[ "$HEAD_REF" == release-please--* ]]; then
+          if [[ "$EVENT" == "pull_request" || "$EVENT" == "workflow_run" ]]; then
             ver=$(jq -r '.["."] // empty' .release-please-manifest.json)
             [[ -n "$ver" ]] && tags="${ver}-beta ${tags}"
           fi
@@ -66,6 +109,7 @@ jobs:
 
   build:
     needs: prep
+    if: needs.prep.outputs.sha != ''
     strategy:
       fail-fast: false
       matrix:
@@ -80,7 +124,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          ref: ${{ github.event.pull_request.head.sha || inputs.ref || github.sha }}
+          ref: ${{ needs.prep.outputs.sha }}
           persist-credentials: false
 
       - uses: docker/setup-buildx-action@v4
@@ -99,12 +143,13 @@ jobs:
           tags: ${{ needs.prep.outputs.arch_tag }}-${{ matrix.arch }}
           labels: |
             org.opencontainers.image.source=${{ github.event.repository.html_url }}
-            org.opencontainers.image.revision=${{ github.event.pull_request.head.sha || github.sha }}
+            org.opencontainers.image.revision=${{ needs.prep.outputs.sha }}
           cache-from: type=gha,scope=beta-${{ matrix.arch }}
           cache-to: type=gha,mode=max,scope=beta-${{ matrix.arch }}
 
   merge:
     needs: [prep, build]
+    if: needs.prep.outputs.sha != ''
     runs-on: ubuntu-latest
     steps:
       - uses: docker/setup-buildx-action@v4
