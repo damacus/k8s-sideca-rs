@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.6](https://github.com/damacus/k8s-sideca-rs/compare/v0.2.5...v0.2.6) (2026-10-29)
+
+
+### Bug Fixes
+
+* **http:** stop forwarding REQ_* credentials to .url downloads ([#59](https://github.com/damacus/k8s-sideca-rs/issues/59)) ([1ccd1d7](https://github.com/damacus/k8s-sideca-rs/commit/1ccd1d7c59dc326fda620dc713efb835c333ad98))
+
 ## [0.2.5](https://github.com/damacus/k8s-sideca-rs/compare/v0.2.4...v0.2.5) (2026-10-06)
 
 
