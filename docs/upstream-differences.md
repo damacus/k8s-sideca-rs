@@ -34,6 +34,12 @@ Deliberate behaviour changes relative to `kiwigrid/k8s-sidecar` `2.11.2`.
   kept rather than deleted at the end of the relist.
 - **Failed `.url` fetch keeps the previous file** — upstream writes an empty
   file.
+- **`.url` fetches never send `REQ_*` credentials** — upstream shares one
+  authenticated session between the reload callback and `.url` downloads, so
+  `REQ_USERNAME`/`REQ_PASSWORD` go to whatever URL appears in a `*.url` key.
+  Anyone able to create a labeled ConfigMap or Secret could exfiltrate the
+  credentials to an arbitrary endpoint. Credentials are only sent to
+  `REQ_URL`; `.url` downloads share the retry/timeout budget only.
 - **Failed reload callbacks stay pending** and are retried; upstream drops
   them after the retry budget is exhausted.
 - **Non-JSON `REQ_PAYLOAD` is sent as `text/plain`** — upstream posts it with

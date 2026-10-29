@@ -17,7 +17,7 @@
 
 Compatibility target is upstream `kiwigrid/k8s-sidecar` **2.11.2**.
 Intentional deviations (hardening, reliability fixes) are fine — document
-them in README "Deliberate differences" and cover them with tests. Do not
+them in `docs/upstream-differences.md` and cover them with tests. Do not
 replicate upstream bugs.
 
 ## Releases
