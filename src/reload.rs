@@ -386,6 +386,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reload_callback_sends_basic_auth() {
+        // The REQ_URL callback is the legitimate consumer of REQ_* credentials
+        // — stripping them there too would break authenticated reloads.
+        let (url, rx) = capture_once(200);
+        let mut c = cfg(url);
+        c.common.username = Some("sidecar".into());
+        c.common.password = Some("s3cret".into());
+        let r = Reloader::new(c, client());
+        r.attempt().await.unwrap();
+
+        let req = rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let head = req.split("\r\n\r\n").next().unwrap();
+        // "sidecar:s3cret" in standard base64 (header name is lowercase on
+        // the wire; the credential value is what must arrive intact).
+        assert!(
+            head.contains("c2lkZWNhcjpzM2NyZXQ="),
+            "expected basic-auth header on REQ_URL callback, got:\n{head}"
+        );
+    }
+
+    #[tokio::test]
     async fn flush_delivers_pending_generation_once() {
         // METHOD=LIST never runs the reloader loop — flush() is its exit path.
         let hits = Arc::new(AtomicUsize::new(0));

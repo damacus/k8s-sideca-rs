@@ -54,10 +54,10 @@ use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 use k8s_sideca_rs::config::{self, Config, LogFormat, Method, Namespaces};
-use k8s_sideca_rs::files::{Reconciler, UrlFetcher};
+use k8s_sideca_rs::files::Reconciler;
 use k8s_sideca_rs::health::{self, HealthState};
-use k8s_sideca_rs::http::build_req_client;
-use k8s_sideca_rs::reload::{self, Reloader};
+use k8s_sideca_rs::http::{HttpFetcher, build_req_client};
+use k8s_sideca_rs::reload::Reloader;
 use k8s_sideca_rs::watch::{self, SyncEvent, reconcile_loop, run_lister, run_watcher, stream_id};
 
 const SA_NAMESPACE_FILE: &str = "/var/run/secrets/kubernetes.io/serviceaccount/namespace";
@@ -153,10 +153,7 @@ async fn run() -> i32 {
         health.register_stream(s, *heartbeat);
     }
 
-    let fetcher = HttpFetcher {
-        http: http.clone(),
-        settings: cfg.fetch.clone(),
-    };
+    let fetcher = HttpFetcher::new(http.clone(), &cfg.fetch);
     let reloader = cfg.req.clone().map(|r| Reloader::new(r, http.clone()));
 
     let once = cfg.method == Method::List;
@@ -307,57 +304,6 @@ async fn build_client(cfg: &Config) -> Result<Client, String> {
     kcfg.read_timeout = Some(Duration::from_secs(cfg.watch_client_timeout));
     kcfg.connect_timeout = Some(Duration::from_secs(cfg.watch_client_timeout));
     Client::try_from(kcfg).map_err(|e| e.to_string())
-}
-
-/// `.url` key downloads — same shared HTTP session semantics as upstream:
-/// GET with the REQ_* auth/retry/timeout budget; response bodies are written
-/// verbatim (including 4xx); 5xx bodies are only written when `ENABLE_5XX`.
-struct HttpFetcher {
-    http: reqwest::Client,
-    settings: config::FetchSettings,
-}
-
-impl UrlFetcher for HttpFetcher {
-    async fn fetch(&self, url: &str, _binary: bool) -> Result<Vec<u8>, String> {
-        let mut tracker = self.settings.retries.tracker();
-        let mut delay = Duration::ZERO;
-        loop {
-            if tracker.retries_taken() > 0 {
-                tokio::time::sleep(delay).await;
-            }
-            let mut req = self.http.get(url).timeout(self.settings.timeout);
-            if let Some(h) = reload::basic_auth_header(&self.settings) {
-                req = req.header(reqwest::header::AUTHORIZATION, h);
-            }
-            match req.send().await {
-                Ok(resp) => {
-                    if resp.status().is_server_error() && !self.settings.enable_5xx {
-                        let Some(d) = tracker.failed(config::FailureKind::Status) else {
-                            return Err(format!("{url} returned {}", resp.status()));
-                        };
-                        delay = d;
-                        continue;
-                    }
-                    return resp
-                        .bytes()
-                        .await
-                        .map(|b| b.to_vec())
-                        .map_err(|e| e.to_string());
-                }
-                Err(e) => {
-                    let kind = if e.is_connect() {
-                        config::FailureKind::Connect
-                    } else {
-                        config::FailureKind::Read
-                    };
-                    let Some(d) = tracker.failed(kind) else {
-                        return Err(e.to_string());
-                    };
-                    delay = d;
-                }
-            }
-        }
-    }
 }
 
 fn init_logging(cfg: &Config) {
